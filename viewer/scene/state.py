@@ -1,0 +1,123 @@
+import os
+import threading
+
+import numpy as np
+import torch
+from loguru import logger
+
+from viewer.scene.bounds import compute_scene_bounds
+from viewer.scene.frustums import build_camera_frustums
+from viewer.scene.point_cloud import extract_point_cloud
+from viewer.scene.loaders import ColmapLoader, PlyLoader
+
+
+class SceneState:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self.colmap_cameras = {}
+        self.colmap_images = {}
+        self.colmap_points3D = {}
+        self.gaussians = {
+            "means": None,
+            "quats": None,
+            "scales": None,
+            "opacities": None,
+            "colors": None,
+            "sh_degree": 0,
+        }
+        self.has_colmap = False
+        self.has_gaussians = False
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._version = 0
+
+    def _bump_version(self):
+        with self._lock:
+            self._version += 1
+
+    def get_scene_version(self):
+        with self._lock:
+            return self._version
+
+    def load_colmap(self, path):
+        """Parse a COLMAP dataset directory."""
+        with self._lock:
+            try:
+                result = ColmapLoader().load(path)
+                self.colmap_cameras = result["cameras"]
+                self.colmap_images = result["images"]
+                self.colmap_points3D = result["points3D"]
+                self.has_colmap = bool(
+                    self.colmap_cameras or self.colmap_images or self.colmap_points3D
+                )
+                self._bump_version()
+            except Exception as e:
+                logger.error(f"Failed to load COLMAP from {path}: {e}")
+                self.has_colmap = False
+
+    def load_ply(self, path):
+        """Parse a 3DGS PLY file."""
+        with self._lock:
+            try:
+                result = PlyLoader().load(path)
+                gaussians = result["gaussians"]
+                if gaussians is not None:
+                    self.gaussians = gaussians
+                    self.has_gaussians = True
+                    self._bump_version()
+
+                    # Debug: log gaussian bounds and stats
+                    means_np = self.gaussians["means"].cpu().numpy()
+                    N = means_np.shape[0]
+                    scales_np = self.gaussians["scales"].cpu().numpy()
+                    opacities_np = self.gaussians["opacities"].cpu().numpy()
+                    colors_np = self.gaussians["colors"].cpu().numpy()
+                    logger.info(f"Device: {self._device}")
+                    logger.info(f"Gaussians count: {N}")
+                    logger.info(f"Means bounds: min={means_np.min(axis=0)}, max={means_np.max(axis=0)}")
+                    logger.info(f"Means mean: {means_np.mean(axis=0)}")
+                    logger.info(f"Scales min/max/mean: {scales_np.min():.4f}/{scales_np.max():.4f}/{scales_np.mean():.4f}")
+                    logger.info(f"Opacities min/max/mean: {opacities_np.min():.4f}/{opacities_np.max():.4f}/{opacities_np.mean():.4f}")
+                    logger.info(f"Colors min/max/mean: {colors_np.min():.4f}/{colors_np.max():.4f}/{colors_np.mean():.4f}")
+                    logger.info(f"SH degree: {self.gaussians['sh_degree']}")
+                else:
+                    self.has_gaussians = False
+            except Exception as e:
+                logger.error(f"Failed to load PLY from {path}: {e}")
+                self.has_gaussians = False
+
+    def snapshot_gaussians(self):
+        """Return a shallow copy of gaussian tensors under lock (for render thread)."""
+        with self._lock:
+            if not self.has_gaussians:
+                return None
+            return {
+                "means": self.gaussians["means"],
+                "quats": self.gaussians["quats"],
+                "scales": self.gaussians["scales"],
+                "opacities": self.gaussians["opacities"],
+                "colors": self.gaussians["colors"],
+                "sh_degree": self.gaussians["sh_degree"],
+            }
+
+    def get_scene_bounds(self):
+        """Return axis-aligned bounding box (min, max) of camera positions and points."""
+        with self._lock:
+            return compute_scene_bounds(self.colmap_images, self.colmap_points3D)
+
+    def get_camera_frustums(self, render_settings=None):
+        """Return list of (position, corners) for each COLMAP image."""
+        with self._lock:
+            if not self.has_colmap or not self.colmap_images or not self.colmap_cameras:
+                return []
+            bmin, bmax = compute_scene_bounds(self.colmap_images, self.colmap_points3D)
+            scene_scale = float(np.linalg.norm(bmax - bmin))
+            return build_camera_frustums(
+                self.colmap_images, self.colmap_cameras, render_settings, scene_scale
+            )
+
+    def get_point_cloud(self):
+        """Return (xyz, rgb) numpy arrays from colmap_points3D."""
+        with self._lock:
+            if not self.has_colmap or not self.colmap_points3D:
+                return None, None
+            return extract_point_cloud(self.colmap_points3D)
