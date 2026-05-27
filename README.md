@@ -18,16 +18,36 @@ pip install -e .
 
 ```bash
 # Load a 3DGS PLY file
-python -m viewer --ply path/to/model.ply
+uv run python -m viewer --ply path/to/model.ply
 
 # Load a COLMAP dataset
-python -m viewer --colmap path/to/colmap/
+uv run python -m viewer --colmap path/to/colmap/
+
+# Example: load a 360_v2 bonsai scene
+uv run python -m viewer --colmap ../data/360_v2/bonsai/
 
 # Both + custom resolution
-python -m viewer --ply model.ply --colmap dataset/ --width 1920 --height 1080
+uv run python -m viewer --ply model.ply --colmap dataset/ --width 1920 --height 1080
 
 # Debug logging
-python -m viewer --ply model.ply --log-level DEBUG
+uv run python -m viewer --ply model.ply --log-level DEBUG
+
+# See all options
+uv run python -m viewer --help
+```
+
+```
+usage: __main__.py [-h] [--colmap COLMAP] [--ply PLY] [--width WIDTH] [--height HEIGHT] [--log-level {TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,CRITICAL}] [--log-file LOG_FILE]
+
+options:
+  -h, --help            show this help message and exit
+  --colmap COLMAP
+  --ply PLY
+  --width WIDTH
+  --height HEIGHT
+  --log-level {TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,CRITICAL}
+                        Log level for stderr (and file if --log-file is set). Default: INFO
+  --log-file LOG_FILE   Optional file path to also write logs to
 ```
 
 ## Controls
