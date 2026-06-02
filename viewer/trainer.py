@@ -15,6 +15,7 @@ from loguru import logger
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import MCMCStrategy, DefaultStrategy
+from gsplat import export_splats
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +209,10 @@ def _ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> torc
     return ssim_map.mean()
 
 
+# Compile SSIM for speed (low-overhead mode for small graphs)
+_compiled_ssim = torch.compile(_ssim, mode="reduce-overhead", dynamic=False, fullgraph=False)
+
+
 def _rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     """Convert RGB to SH DC coefficients."""
     C0 = 0.28209479177387814
@@ -277,6 +282,8 @@ class TrainerConfig:
     test_every: int = 8
     device: str = "cuda"
     strategy: str = "mcmc"  # "mcmc" or "default"
+    headless: bool = False
+    output_dir: str = "./output"
 
 
 class Trainer:
@@ -344,6 +351,12 @@ class Trainer:
             logger.info(f"[TRAINER] Using device: {device}")
             if torch.cuda.is_available():
                 logger.info(f"[TRAINER] CUDA device: {torch.cuda.get_device_name(0)}")
+                # Enable TF32 for faster matmul on Ampere+ GPUs
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.set_float32_matmul_precision('high')
+                # Allow cuDNN to benchmark optimal algorithms for consistent input sizes
+                torch.backends.cudnn.benchmark = True
 
             # Parse COLMAP data
             parser = _SimpleColmapParser(
@@ -388,17 +401,17 @@ class Trainer:
                 self._optimizers["means"], gamma=0.01 ** (1.0 / cfg.num_iterations)
             )
 
-            # DataLoader: use num_workers=0 to avoid multiprocessing overhead.
-            # With batch_size=1 and imageio (fast), the main thread can load
-            # images quickly enough. This avoids the RAM explosion from 4
-            # worker processes each holding copies of the dataset.
-            self._trainloader = torch.utils.data.DataLoader(
-                trainset,
-                batch_size=cfg.batch_size,
-                shuffle=True,
-                num_workers=0,
-                pin_memory=False,
-            )
+            # DataLoader: use num_workers>0 for prefetching and pin_memory
+            # for faster async CPU->GPU transfers. persistent_workers avoids
+            # process spawn overhead across epochs.
+            loader_kwargs = {
+                "batch_size": cfg.batch_size,
+                "shuffle": True,
+                "num_workers": 4,
+                "persistent_workers": True,
+                "pin_memory": True,
+            }
+            self._trainloader = torch.utils.data.DataLoader(trainset, **loader_kwargs)
             self._trainloader_iter = iter(self._trainloader)
 
             # Training loop
@@ -416,10 +429,9 @@ class Trainer:
                 t_data = time.time() - t_data_start
 
                 t_gpu_start = time.time()
-                camtoworlds = data["camtoworld"].to(device, non_blocking=False)
-                Ks = data["K"].to(device, non_blocking=False)
-                pixels = data["image"].to(device, non_blocking=False) / 255.0
-                image_ids = data["image_id"].to(device, non_blocking=False)
+                camtoworlds = data["camtoworld"].to(device, non_blocking=True)
+                Ks = data["K"].to(device, non_blocking=True)
+                pixels = data["image"].to(device, non_blocking=True) / 255.0
 
                 height, width = pixels.shape[1:3]
 
@@ -458,7 +470,7 @@ class Trainer:
 
                 # Loss: SSIM + L1
                 l1loss = F.l1_loss(colors_render, pixels)
-                ssimloss = 1.0 - _ssim(
+                ssimloss = 1.0 - _compiled_ssim(
                     colors_render.permute(0, 3, 1, 2),
                     pixels.permute(0, 3, 1, 2),
                 )
@@ -503,21 +515,21 @@ class Trainer:
                         packed=False,
                     )
 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                t_gpu = time.time() - t_gpu_start
-
                 self.current_iteration = step + 1
                 self.current_splats = len(self._splats['means'])
 
                 # Every 100 iterations: update viewer and log loss
                 if (step + 1) % 100 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_gpu = time.time() - t_gpu_start
                     loss_val = loss.item()
                     with self._lock:
                         self.loss_history.append((step + 1, loss_val))
 
-                    # Export gaussians to scene_state
-                    self._export_gaussians()
+                    # Export gaussians to scene_state (skip in headless mode)
+                    if not cfg.headless:
+                        self._export_gaussians()
 
                     elapsed = time.time() - self._train_start_time
                     it_per_sec = (step + 1) / elapsed if elapsed > 0 else 0.0
@@ -532,6 +544,10 @@ class Trainer:
 
             self.status_message = "Training complete"
             logger.info("Training complete")
+
+            # Save final PLY in headless mode
+            if cfg.headless and self._splats is not None:
+                self._save_ply(colmap_path)
 
         except Exception as e:
             logger.error(f"Training failed: {e}")
@@ -576,3 +592,30 @@ class Trainer:
                 self.scene_state.has_gaussians = True
                 self.scene_state._default_gaussians = False
                 self.scene_state._bump_version()
+
+    def _save_ply(self, colmap_path: str):
+        """Export current splats to a PLY file."""
+        cfg = self.config
+        os.makedirs(cfg.output_dir, exist_ok=True)
+        scene_name = Path(colmap_path).name or "scene"
+        ply_path = os.path.join(cfg.output_dir, f"{scene_name}.ply")
+
+        with torch.no_grad():
+            means = self._splats["means"].detach().clone()
+            scales = self._splats["scales"].detach().clone()
+            quats = self._splats["quats"].detach().clone()
+            opacities = self._splats["opacities"].detach().clone()
+            sh0 = self._splats["sh0"].detach().clone()
+            shN = self._splats["shN"].detach().clone()
+
+        export_splats(
+            means=means,
+            scales=scales,
+            quats=quats,
+            opacities=opacities,
+            sh0=sh0,
+            shN=shN,
+            format="ply",
+            save_to=ply_path,
+        )
+        logger.info(f"Saved PLY to {ply_path}")

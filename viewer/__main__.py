@@ -35,6 +35,8 @@ def main():
                         help="Optional file path to also write logs to")
     parser.add_argument("--headless", action="store_true",
                         help="Run training in headless mode (requires --colmap). No GUI is shown.")
+    parser.add_argument("--output", type=str, default="./output",
+                        help="Output directory for saved PLY files in headless mode. Default: ./output")
     args = parser.parse_args()
 
     _configure_logging(args.log_level, args.log_file)
@@ -42,20 +44,21 @@ def main():
     if args.headless:
         if not args.colmap:
             parser.error("--headless requires --colmap")
-        _run_headless(args.colmap)
+        _run_headless(args.colmap, args.output)
     else:
         from viewer.app import App
         app = App(width=args.width, height=args.height, colmap_path=args.colmap, ply_path=args.ply)
         app.run()
 
 
-def _run_headless(colmap_path: str):
+def _run_headless(colmap_path: str, output_dir: str = "./output"):
     """Run training directly without any GUI."""
     from viewer.scene import SceneState
     from viewer.trainer import Trainer, TrainerConfig
 
     scene_state = SceneState()
-    trainer = Trainer(scene_state, TrainerConfig())
+    cfg = TrainerConfig(headless=True, output_dir=output_dir)
+    trainer = Trainer(scene_state, cfg)
     logger.info(f"Starting headless training on {colmap_path}")
     trainer.start(colmap_path)
 
