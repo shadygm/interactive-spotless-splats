@@ -7,6 +7,7 @@ class RenderSettings:
 
     frustum_color: list = field(default_factory=lambda: [1.0, 1.0, 1.0])
     frustum_size: float = 0.001  # fraction of scene diagonal
+    show_frustums: bool = True
     point_size: float = 1.0
     _frustum_version: int = 0
 

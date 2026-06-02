@@ -109,7 +109,7 @@ class DebugPass:
             else:
                 self._point_count = 0
 
-    def render(self, camera, scene_state, width, height):
+    def render(self, camera, scene_state, width, height, skip_points=False):
         """Render debug overlays using cached VAOs."""
         import time
         t0 = time.perf_counter()
@@ -119,7 +119,7 @@ class DebugPass:
         current_frustum_version = self.render_settings.get_frustum_version() if self.render_settings else 0
 
         rebuild_frustums = current_frustum_version != self._cached_frustum_version or current_scene_version != self._cached_scene_version
-        rebuild_points = current_scene_version != self._cached_scene_version
+        rebuild_points = current_scene_version != self._cached_scene_version and not skip_points
 
         if rebuild_frustums or rebuild_points:
             self.update_debug_cache(scene_state, rebuild_frustums, rebuild_points)
@@ -136,7 +136,8 @@ class DebugPass:
         glDisable(GL_DEPTH_TEST)
 
         # Draw frustums (instanced)
-        if self._frustum_instance_count > 0:
+        show_frustums = getattr(self.render_settings, 'show_frustums', True)
+        if show_frustums and self._frustum_instance_count > 0:
             self._frustum_program.use()
             self._frustum_program.set_mat4("mvp", mvp)
             color = self.render_settings.frustum_color if self.render_settings else [1.0, 1.0, 1.0]
@@ -144,8 +145,8 @@ class DebugPass:
             glBindVertexArray(self._frustum_vao)
             glDrawArraysInstanced(GL_LINES, 0, 16, self._frustum_instance_count)
 
-        # Draw points
-        if self._point_count > 0:
+        # Draw points (skip when training to avoid clutter)
+        if not skip_points and self._point_count > 0:
             glEnable(GL_PROGRAM_POINT_SIZE)
             self._debug_program.use()
             self._debug_program.set_mat4("mvp", mvp)

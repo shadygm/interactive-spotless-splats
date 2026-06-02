@@ -44,6 +44,7 @@ class SceneState:
                 self.has_colmap = bool(
                     self.colmap_cameras or self.colmap_images or self.colmap_points3D
                 )
+                self._last_colmap_path = path
                 if self._default_gaussians:
                     self.gaussians = None
                     self.has_gaussians = False

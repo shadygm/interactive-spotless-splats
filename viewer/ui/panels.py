@@ -77,6 +77,13 @@ class RenderSettingsPanel(Panel):
 
     def draw(self):
         if imgui.collapsing_header("Frustums", imgui.TreeNodeFlags_.default_open):
+            changed_visible, new_visible = imgui.checkbox(
+                "Show Camera Frustums", self.render_settings.show_frustums
+            )
+            if changed_visible:
+                self.render_settings.show_frustums = new_visible
+                logger.debug(f"Camera frustums visibility: {new_visible}")
+
             c = self.render_settings.frustum_color
             changed_color, new_color = imgui.color_edit3("Frustum color", c)
             if changed_color:

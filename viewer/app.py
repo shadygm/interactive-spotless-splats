@@ -13,6 +13,7 @@ from loguru import logger
 import glfw
 
 from imgui_bundle import imgui
+from imgui_bundle import implot
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 import imgui_bundle.imgui.internal as internal
 
@@ -41,6 +42,7 @@ from viewer.ui import UI, RenderSettings
 from viewer.renderer import Renderer
 from viewer.theme import apply_gruvbox_theme
 from viewer.input import InputHandler
+from viewer.trainer import Trainer, TrainerConfig
 
 
 class App:
@@ -72,6 +74,7 @@ class App:
 
         # ImGui setup with docking
         imgui.create_context()
+        implot.create_context()
         apply_gruvbox_theme()
         io = imgui.get_io()
         io.config_flags |= imgui.ConfigFlags_.docking_enable
@@ -82,7 +85,8 @@ class App:
         self.scene_state = SceneState()
         self.render_settings = RenderSettings()
         self.renderer = Renderer(width, height, device=self.scene_state._device, render_settings=self.render_settings)
-        self.ui = UI(self.scene_state, self.renderer, self.render_settings, self.camera)
+        self.trainer = Trainer(self.scene_state, TrainerConfig())
+        self.ui = UI(self.scene_state, self.renderer, self.render_settings, self.camera, self.trainer)
         self.input_handler = InputHandler(self.window, self.camera, self.render_settings)
 
         # Load initial data if provided
@@ -141,6 +145,7 @@ class App:
         dock_id_right = result[0]
         internal.dock_builder_dock_window("Scene", dock_id_right)
         internal.dock_builder_dock_window("Render Settings", dock_id_right)
+        internal.dock_builder_dock_window("Trainer", dock_id_right)
         internal.dock_builder_finish(dockspace_id)
 
         self._dockspace_setup_done = True
@@ -200,6 +205,11 @@ class App:
             self.ui.draw_render_settings()
             imgui.end()
 
+            # Trainer panel (auto-docked to right split as a tab)
+            imgui.begin("Trainer")
+            self.ui.draw_trainer()
+            imgui.end()
+
             # Process all input
             self.input_handler.process(dt)
 
@@ -230,7 +240,10 @@ class App:
             gsplat_ok = self.renderer.render_gsplat(self.camera, gaussians, self.width, self.height)
             if gsplat_ok:
                 self.renderer.render_texture_to_screen()
-            self.renderer.render_debug(self.camera, self.scene_state, self.width, self.height)
+            self.renderer.render_debug(
+                self.camera, self.scene_state, self.width, self.height,
+                skip_points=self.trainer.is_running,
+            )
             t4 = time.perf_counter()
 
             # ImGui draw on top
@@ -246,5 +259,6 @@ class App:
 
 
         self.impl.shutdown()
+        implot.destroy_context()
         glfw.destroy_window(self.window)
         glfw.terminate()

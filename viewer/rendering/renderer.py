@@ -59,9 +59,9 @@ class Renderer:
         self._has_texture_content = ok
         return ok
 
-    def render_debug(self, camera, scene_state, width, height):
+    def render_debug(self, camera, scene_state, width, height, skip_points=False):
         """Render debug overlays using cached VAOs."""
-        self._debug_pass.render(camera, scene_state, width, height)
+        self._debug_pass.render(camera, scene_state, width, height, skip_points=skip_points)
 
     def render_texture_to_screen(self):
         """Draw a fullscreen quad with the gsplat texture."""
