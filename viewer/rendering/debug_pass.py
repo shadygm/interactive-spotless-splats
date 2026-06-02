@@ -24,7 +24,7 @@ _FRUSTUM_TEMPLATE = np.array([
 
 
 class DebugPass:
-    """Owns grid, frustums, and points rendering."""
+    """Owns frustums and points rendering."""
 
     def __init__(self, render_settings=None):
         self.render_settings = render_settings
@@ -34,12 +34,6 @@ class DebugPass:
 
         # Compile instanced frustum shader
         self._frustum_program = ShaderProgram(FRUSTUM_VERTEX, FRUSTUM_FRAGMENT, validate=False)
-
-        # Grid VAO + VBO (static)
-        self._grid_vao = glGenVertexArrays(1)
-        self._grid_vbo = VBO()
-        self._grid_count = 0
-        self._build_grid_vbo()
 
         # Frustum VAO + template VBO + instance VBO
         self._frustum_vao = glGenVertexArrays(1)
@@ -55,31 +49,7 @@ class DebugPass:
 
         # Cached versions to detect changes
         self._cached_scene_version = -1
-        self._cached_grid_version = -1
         self._cached_frustum_version = -1
-
-    def _build_grid_vbo(self, extent=10.0):
-        """Build grid VBO scaled to scene size."""
-        grid_verts = []
-        color = self.render_settings.grid_color if self.render_settings else [0.5, 0.5, 0.5]
-        step = max(1.0, extent / 100.0)
-        n = int(extent / step)
-        for i in range(-n, n + 1):
-            x = i * step
-            grid_verts.append([x, 0.0, -extent] + color)
-            grid_verts.append([x, 0.0, extent] + color)
-            grid_verts.append([-extent, 0.0, x] + color)
-            grid_verts.append([extent, 0.0, x] + color)
-        grid_data = np.array(grid_verts, dtype=np.float32)
-
-        glBindVertexArray(self._grid_vao)
-        self._grid_vbo.upload(grid_data)
-        self._grid_vbo.set_attrib(0, 3, 6 * 4, 0)
-        self._grid_vbo.set_attrib(1, 3, 6 * 4, 3 * 4)
-        glBindVertexArray(0)
-
-        self._grid_count = len(grid_verts)
-        logger.debug(f"Grid VAO built: {self._grid_count} vertices (extent={extent:.1f})")
 
     def _build_frustum_template_vbo(self):
         """Build static frustum template VBO (one frustum topology)."""
@@ -89,16 +59,8 @@ class DebugPass:
         glBindVertexArray(0)
         logger.debug("Frustum template VBO built")
 
-    def update_debug_cache(self, scene_state, rebuild_grid=True, rebuild_frustums=True, rebuild_points=True):
+    def update_debug_cache(self, scene_state, rebuild_frustums=True, rebuild_points=True):
         """Rebuild specified VBOs."""
-        if rebuild_grid:
-            bmin, bmax = scene_state.get_scene_bounds()
-            scene_extent = float(np.linalg.norm(bmax - bmin)) * 3.0
-            if scene_extent < 50.0:
-                scene_extent = 50.0
-            self._build_grid_vbo(scene_extent)
-            logger.debug(f"Grid rebuilt (extent={scene_extent:.1f})")
-
         if rebuild_frustums:
             frustums = scene_state.get_camera_frustums(self.render_settings)
             if frustums:
@@ -154,17 +116,14 @@ class DebugPass:
 
         # Check what needs rebuilding
         current_scene_version = scene_state.get_scene_version()
-        current_grid_version = self.render_settings.get_grid_version() if self.render_settings else 0
         current_frustum_version = self.render_settings.get_frustum_version() if self.render_settings else 0
 
-        rebuild_grid = current_grid_version != self._cached_grid_version
         rebuild_frustums = current_frustum_version != self._cached_frustum_version or current_scene_version != self._cached_scene_version
         rebuild_points = current_scene_version != self._cached_scene_version
 
-        if rebuild_grid or rebuild_frustums or rebuild_points:
-            self.update_debug_cache(scene_state, rebuild_grid, rebuild_frustums, rebuild_points)
+        if rebuild_frustums or rebuild_points:
+            self.update_debug_cache(scene_state, rebuild_frustums, rebuild_points)
             self._cached_scene_version = current_scene_version
-            self._cached_grid_version = current_grid_version
             self._cached_frustum_version = current_frustum_version
         t1 = time.perf_counter()
 
@@ -175,14 +134,6 @@ class DebugPass:
         mvp = (proj @ view).astype(np.float32)
 
         glDisable(GL_DEPTH_TEST)
-
-        # Draw grid
-        grid_enabled = self.render_settings.grid_enabled if self.render_settings else True
-        if grid_enabled and self._grid_count > 0:
-            self._debug_program.use()
-            self._debug_program.set_mat4("mvp", mvp)
-            glBindVertexArray(self._grid_vao)
-            glDrawArrays(GL_LINES, 0, self._grid_count)
 
         # Draw frustums (instanced)
         if self._frustum_instance_count > 0:

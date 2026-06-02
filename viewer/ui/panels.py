@@ -76,19 +76,6 @@ class RenderSettingsPanel(Panel):
         self.scene_state = scene_state
 
     def draw(self):
-        if imgui.collapsing_header("Grid", imgui.TreeNodeFlags_.default_open):
-            changed_enabled, new_enabled = imgui.checkbox("Show grid", self.render_settings.grid_enabled)
-            if changed_enabled:
-                self.render_settings.grid_enabled = new_enabled
-                logger.debug(f"Grid enabled: {new_enabled}")
-
-            c = self.render_settings.grid_color
-            changed_color, new_color = imgui.color_edit3("Grid color", c)
-            if changed_color:
-                self.render_settings.grid_color = list(new_color)
-                self.render_settings.bump_grid()
-                logger.debug("Grid color changed")
-
         if imgui.collapsing_header("Frustums", imgui.TreeNodeFlags_.default_open):
             c = self.render_settings.frustum_color
             changed_color, new_color = imgui.color_edit3("Frustum color", c)

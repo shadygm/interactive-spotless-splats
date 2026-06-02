@@ -98,9 +98,8 @@ class App:
         logger.info(f"Camera fitted to scene bounds: min={bmin}, max={bmax}, radius={radius:.2f}")
 
         # Build debug VBO caches for any pre-loaded data
-        self.renderer.update_debug_cache(self.scene_state, True, True, True)
+        self.renderer.update_debug_cache(self.scene_state, True, True)
         self.renderer._cached_scene_version = self.scene_state.get_scene_version()
-        self.renderer._cached_grid_version = self.render_settings.get_grid_version()
         self.renderer._cached_frustum_version = self.render_settings.get_frustum_version()
 
         # Callbacks
@@ -209,7 +208,7 @@ class App:
             pending_ply = self.ui.pending_ply_path
             if pending_colmap is not None:
                 self.scene_state.load_colmap(pending_colmap)
-                self.renderer.update_debug_cache(self.scene_state, True, True, True)
+                self.renderer.update_debug_cache(self.scene_state, True, True)
             if pending_ply is not None:
                 self.scene_state.load_ply(pending_ply)
             if pending_colmap is not None or pending_ply is not None:
@@ -231,8 +230,7 @@ class App:
             gsplat_ok = self.renderer.render_gsplat(self.camera, gaussians, self.width, self.height)
             if gsplat_ok:
                 self.renderer.render_texture_to_screen()
-            else:
-                self.renderer.render_debug(self.camera, self.scene_state, self.width, self.height)
+            self.renderer.render_debug(self.camera, self.scene_state, self.width, self.height)
             t4 = time.perf_counter()
 
             # ImGui draw on top

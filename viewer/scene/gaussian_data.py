@@ -2,6 +2,51 @@ import numpy as np
 import torch
 
 
+def build_axis_gaussians(device: str) -> dict:
+    """Build 4 canonical axis-aligned Gaussians (origin + X/Y/Z directions).
+
+    Returns a dict with keys: means, quats, scales, opacities, colors, sh_degree.
+    """
+    means = np.array([
+        [0, 0, 0],
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1],
+    ], dtype=np.float32)
+
+    quats = np.array([
+        [1, 0, 0, 0],
+        [1, 0, 0, 0],
+        [1, 0, 0, 0],
+        [1, 0, 0, 0],
+    ], dtype=np.float32)
+
+    scales = np.array([
+        [0.1, 0.1, 0.1],
+        [0.5, 0.1, 0.1],
+        [0.1, 0.5, 0.1],
+        [0.1, 0.1, 0.5],
+    ], dtype=np.float32)
+
+    opacities = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+
+    colors = np.array([
+        [1.0, 1.0, 1.0],  # origin - white
+        [1.0, 0.0, 0.0],  # X - red
+        [0.0, 1.0, 0.0],  # Y - green
+        [0.0, 0.0, 1.0],  # Z - blue
+    ], dtype=np.float32)[:, None, :]  # (4, 1, 3)
+
+    return {
+        "means": torch.from_numpy(means).to(device),
+        "quats": torch.from_numpy(quats).to(device),
+        "scales": torch.from_numpy(scales).to(device),
+        "opacities": torch.from_numpy(opacities).to(device),
+        "colors": torch.from_numpy(colors).to(device),
+        "sh_degree": 0,
+    }
+
+
 def _determine_sh_degree(data: dict) -> int:
     """Determine SH degree from f_rest_* properties."""
     rest_keys = [k for k in data.keys() if k.startswith("f_rest_")]

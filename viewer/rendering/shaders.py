@@ -20,7 +20,7 @@ void main() {
 }
 """
 
-# Debug geometry shader (for grid and points)
+# Debug geometry shader (for points and frustums)
 DEBUG_VERTEX = """
 #version 330
 layout(location=0) in vec3 aPos;

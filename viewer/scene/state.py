@@ -9,6 +9,7 @@ from viewer.scene.bounds import compute_scene_bounds
 from viewer.scene.frustums import build_camera_frustums
 from viewer.scene.point_cloud import extract_point_cloud
 from viewer.scene.loaders import ColmapLoader, PlyLoader
+from viewer.scene.gaussian_data import build_axis_gaussians
 
 
 class SceneState:
@@ -17,17 +18,10 @@ class SceneState:
         self.colmap_cameras = {}
         self.colmap_images = {}
         self.colmap_points3D = {}
-        self.gaussians = {
-            "means": None,
-            "quats": None,
-            "scales": None,
-            "opacities": None,
-            "colors": None,
-            "sh_degree": 0,
-        }
-        self.has_colmap = False
-        self.has_gaussians = False
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.gaussians = build_axis_gaussians(self._device)
+        self.has_colmap = False
+        self.has_gaussians = True
         self._version = 0
 
     def _bump_version(self):
@@ -55,13 +49,21 @@ class SceneState:
                 self.has_colmap = False
 
     def load_ply(self, path):
-        """Parse a 3DGS PLY file."""
+        """Parse a 3DGS PLY file and merge with axis Gaussians."""
         with self._lock:
             try:
                 result = PlyLoader().load(path)
-                gaussians = result["gaussians"]
-                if gaussians is not None:
-                    self.gaussians = gaussians
+                ply_gaussians = result["gaussians"]
+                if ply_gaussians is not None:
+                    axis_gaussians = build_axis_gaussians(self._device)
+                    self.gaussians = {
+                        "means": torch.cat([axis_gaussians["means"], ply_gaussians["means"]], dim=0),
+                        "quats": torch.cat([axis_gaussians["quats"], ply_gaussians["quats"]], dim=0),
+                        "scales": torch.cat([axis_gaussians["scales"], ply_gaussians["scales"]], dim=0),
+                        "opacities": torch.cat([axis_gaussians["opacities"], ply_gaussians["opacities"]], dim=0),
+                        "colors": torch.cat([axis_gaussians["colors"], ply_gaussians["colors"]], dim=0),
+                        "sh_degree": max(axis_gaussians["sh_degree"], ply_gaussians["sh_degree"]),
+                    }
                     self.has_gaussians = True
                     self._bump_version()
 
@@ -80,16 +82,14 @@ class SceneState:
                     logger.info(f"Colors min/max/mean: {colors_np.min():.4f}/{colors_np.max():.4f}/{colors_np.mean():.4f}")
                     logger.info(f"SH degree: {self.gaussians['sh_degree']}")
                 else:
-                    self.has_gaussians = False
+                    self.has_gaussians = True  # axis gaussians still present
             except Exception as e:
                 logger.error(f"Failed to load PLY from {path}: {e}")
-                self.has_gaussians = False
+                self.has_gaussians = True  # axis gaussians still present
 
     def snapshot_gaussians(self):
         """Return a shallow copy of gaussian tensors under lock (for render thread)."""
         with self._lock:
-            if not self.has_gaussians:
-                return None
             return {
                 "means": self.gaussians["means"],
                 "quats": self.gaussians["quats"],

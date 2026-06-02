@@ -40,14 +40,6 @@ class Renderer:
         self._debug_pass._cached_scene_version = value
 
     @property
-    def _cached_grid_version(self):
-        return self._debug_pass._cached_grid_version
-
-    @_cached_grid_version.setter
-    def _cached_grid_version(self, value):
-        self._debug_pass._cached_grid_version = value
-
-    @property
     def _cached_frustum_version(self):
         return self._debug_pass._cached_frustum_version
 
@@ -78,9 +70,9 @@ class Renderer:
             return
         self._quad_pass.render_texture_to_screen(self._texture)
 
-    def update_debug_cache(self, scene_state, rebuild_grid=True, rebuild_frustums=True, rebuild_points=True):
+    def update_debug_cache(self, scene_state, rebuild_frustums=True, rebuild_points=True):
         """Rebuild specified VBOs."""
-        self._debug_pass.update_debug_cache(scene_state, rebuild_grid, rebuild_frustums, rebuild_points)
+        self._debug_pass.update_debug_cache(scene_state, rebuild_frustums, rebuild_points)
 
     def resize(self, width, height):
         """Update texture size."""
