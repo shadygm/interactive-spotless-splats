@@ -33,13 +33,40 @@ def main():
                         help="Log level for stderr (and file if --log-file is set). Default: INFO")
     parser.add_argument("--log-file", type=str, default=None,
                         help="Optional file path to also write logs to")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run training in headless mode (requires --colmap). No GUI is shown.")
     args = parser.parse_args()
 
     _configure_logging(args.log_level, args.log_file)
 
-    from viewer.app import App
-    app = App(width=args.width, height=args.height, colmap_path=args.colmap, ply_path=args.ply)
-    app.run()
+    if args.headless:
+        if not args.colmap:
+            parser.error("--headless requires --colmap")
+        _run_headless(args.colmap)
+    else:
+        from viewer.app import App
+        app = App(width=args.width, height=args.height, colmap_path=args.colmap, ply_path=args.ply)
+        app.run()
+
+
+def _run_headless(colmap_path: str):
+    """Run training directly without any GUI."""
+    from viewer.scene import SceneState
+    from viewer.trainer import Trainer, TrainerConfig
+
+    scene_state = SceneState()
+    trainer = Trainer(scene_state, TrainerConfig())
+    logger.info(f"Starting headless training on {colmap_path}")
+    trainer.start(colmap_path)
+
+    try:
+        if trainer._thread is not None:
+            trainer._thread.join()
+    except KeyboardInterrupt:
+        logger.info("Interrupted, stopping training...")
+        trainer.stop()
+
+    logger.info("Headless training finished")
 
 
 if __name__ == "__main__":
