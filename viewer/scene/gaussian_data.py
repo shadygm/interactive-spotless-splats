@@ -2,8 +2,13 @@ import numpy as np
 import torch
 
 
-def build_axis_gaussians(device: str) -> dict:
+def build_axis_gaussians(device: str, sh_degree: int = 0) -> dict:
     """Build 4 canonical axis-aligned Gaussians (origin + X/Y/Z directions).
+
+    Args:
+        device: torch device string.
+        sh_degree: Spherical harmonics degree. If > 0, colors will have shape (4, K, 3)
+                   where K = (sh_degree+1)^2, with DC coefficients set and rest zero.
 
     Returns a dict with keys: means, quats, scales, opacities, colors, sh_degree.
     """
@@ -30,12 +35,15 @@ def build_axis_gaussians(device: str) -> dict:
 
     opacities = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
 
-    colors = np.array([
+    K = (sh_degree + 1) ** 2
+    colors = np.zeros((4, K, 3), dtype=np.float32)
+    dc_colors = np.array([
         [1.0, 1.0, 1.0],  # origin - white
         [1.0, 0.0, 0.0],  # X - red
         [0.0, 1.0, 0.0],  # Y - green
         [0.0, 0.0, 1.0],  # Z - blue
-    ], dtype=np.float32)[:, None, :]  # (4, 1, 3)
+    ], dtype=np.float32)
+    colors[:, 0, :] = dc_colors
 
     return {
         "means": torch.from_numpy(means).to(device),
@@ -43,7 +51,7 @@ def build_axis_gaussians(device: str) -> dict:
         "scales": torch.from_numpy(scales).to(device),
         "opacities": torch.from_numpy(opacities).to(device),
         "colors": torch.from_numpy(colors).to(device),
-        "sh_degree": 0,
+        "sh_degree": sh_degree,
     }
 
 

@@ -20,6 +20,7 @@ class SceneState:
         self.colmap_points3D = {}
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self.gaussians = build_axis_gaussians(self._device)
+        self._default_gaussians = True
         self.has_colmap = False
         self.has_gaussians = True
         self._version = 0
@@ -43,6 +44,10 @@ class SceneState:
                 self.has_colmap = bool(
                     self.colmap_cameras or self.colmap_images or self.colmap_points3D
                 )
+                if self._default_gaussians:
+                    self.gaussians = None
+                    self.has_gaussians = False
+                    self._default_gaussians = False
                 self._bump_version()
             except Exception as e:
                 logger.error(f"Failed to load COLMAP from {path}: {e}")
@@ -55,16 +60,9 @@ class SceneState:
                 result = PlyLoader().load(path)
                 ply_gaussians = result["gaussians"]
                 if ply_gaussians is not None:
-                    axis_gaussians = build_axis_gaussians(self._device)
-                    self.gaussians = {
-                        "means": torch.cat([axis_gaussians["means"], ply_gaussians["means"]], dim=0),
-                        "quats": torch.cat([axis_gaussians["quats"], ply_gaussians["quats"]], dim=0),
-                        "scales": torch.cat([axis_gaussians["scales"], ply_gaussians["scales"]], dim=0),
-                        "opacities": torch.cat([axis_gaussians["opacities"], ply_gaussians["opacities"]], dim=0),
-                        "colors": torch.cat([axis_gaussians["colors"], ply_gaussians["colors"]], dim=0),
-                        "sh_degree": max(axis_gaussians["sh_degree"], ply_gaussians["sh_degree"]),
-                    }
+                    self.gaussians = ply_gaussians
                     self.has_gaussians = True
+                    self._default_gaussians = False
                     self._bump_version()
 
                     # Debug: log gaussian bounds and stats
@@ -83,13 +81,17 @@ class SceneState:
                     logger.info(f"SH degree: {self.gaussians['sh_degree']}")
                 else:
                     self.has_gaussians = True  # axis gaussians still present
+                    self._default_gaussians = True
             except Exception as e:
                 logger.error(f"Failed to load PLY from {path}: {e}")
                 self.has_gaussians = True  # axis gaussians still present
+                self._default_gaussians = True
 
     def snapshot_gaussians(self):
         """Return a shallow copy of gaussian tensors under lock (for render thread)."""
         with self._lock:
+            if self.gaussians is None:
+                return None
             return {
                 "means": self.gaussians["means"],
                 "quats": self.gaussians["quats"],
