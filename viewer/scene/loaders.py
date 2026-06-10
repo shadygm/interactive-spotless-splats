@@ -53,7 +53,15 @@ def _load_point_cloud_records(path: str) -> dict[int, dict]:
             points3D[i] = {"xyz": xyz[i], "rgb": rgb[i]}
         return points3D
 
-    return {}
+    logger.warning(
+        f"No point cloud was found in {path}; creating 1000 fallback points in a 5x5x5 box"
+    )
+    rng = np.random.default_rng(42)
+    xyz = rng.uniform(-2.5, 2.5, size=(50000, 3)).astype(np.float32)
+    rgb = rng.integers(96, 256, size=(50000, 3), dtype=np.uint8)
+    return {
+        i: {"xyz": xyz[i], "rgb": rgb[i]} for i in range(len(xyz))
+    }
 
 
 class ColmapLoader:
@@ -96,6 +104,17 @@ class ColmapLoader:
 
         if not (cameras or images or points3D):
             raise ValueError(f"No COLMAP data found in {sparse_dir}")
+
+        if not points3D:
+            logger.warning(
+                f"No COLMAP point cloud was found in {sparse_dir}; creating 1000 fallback points in a 5x5x5 box"
+            )
+            rng = np.random.default_rng(42)
+            xyz = rng.uniform(-2.5, 2.5, size=(1000, 3)).astype(np.float32)
+            rgb = rng.integers(96, 256, size=(1000, 3), dtype=np.uint8)
+            points3D = {
+                i: {"xyz": xyz[i], "rgb": rgb[i]} for i in range(len(xyz))
+            }
 
         # COLMAP cameras look down positive Z (forward_sign = 1.0)
         for cam in cameras.values():

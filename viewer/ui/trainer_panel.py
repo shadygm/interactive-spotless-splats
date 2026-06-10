@@ -9,15 +9,19 @@ from viewer.ui.panels import Panel
 class TrainerPanel(Panel):
     """GUI panel for 3DGS training controls and loss visualization."""
 
-    def __init__(self, trainer, scene_state):
+    def __init__(self, trainer, scene_state, on_go_to_frustum=None):
         self.trainer = trainer
         self.scene_state = scene_state
+        self.on_go_to_frustum = on_go_to_frustum
 
         # Input buffers for settings
         self._max_splats = trainer.config.max_splats
         self._num_iterations = trainer.config.num_iterations
+        self._data_factor = trainer.config.data_factor
         self._strategy_names = ["mcmc", "default"]
         self._strategy_idx = self._strategy_names.index(trainer.config.strategy)
+        self._go_to_frustum = False
+        self._camera_index = 1
 
     def draw(self):
         has_colmap = self.scene_state.has_colmap
@@ -41,6 +45,14 @@ class TrainerPanel(Panel):
             self._num_iterations = max(100, new_iter)
             self.trainer.config.num_iterations = self._num_iterations
 
+        # Dataset downsampling factor
+        changed_factor, new_factor = imgui.input_int(
+            "Data Factor", self._data_factor, step=1, step_fast=2
+        )
+        if changed_factor:
+            self._data_factor = max(1, new_factor)
+            self.trainer.config.data_factor = self._data_factor
+
         # Strategy selector
         changed_strat, self._strategy_idx = imgui.combo(
             "Strategy", self._strategy_idx, self._strategy_names
@@ -55,6 +67,39 @@ class TrainerPanel(Panel):
         changed_sh, new_sh_idx = imgui.combo("SH Degree", current_sh_idx, sh_labels)
         if changed_sh:
             self.trainer.config.sh_degree = sh_values[new_sh_idx]
+
+        imgui.separator()
+
+        num_cameras = self.scene_state.get_camera_count() if self.scene_state.has_colmap else 0
+        imgui.text("Frustum Navigation")
+        if num_cameras > 0:
+            if self._camera_index > num_cameras:
+                self._camera_index = num_cameras
+            changed_jump, go_to = imgui.checkbox("Go To Frustum", self._go_to_frustum)
+            if changed_jump:
+                self._go_to_frustum = go_to
+                if self._go_to_frustum and self.on_go_to_frustum is not None:
+                    self.on_go_to_frustum(self._camera_index - 1)
+
+            imgui.begin_disabled(not self._go_to_frustum)
+            changed_cam, new_cam = imgui.slider_int(
+                "Camera #",
+                self._camera_index,
+                1,
+                num_cameras,
+            )
+            if changed_cam:
+                self._camera_index = new_cam
+                if self.on_go_to_frustum is not None:
+                    self.on_go_to_frustum(self._camera_index - 1)
+            imgui.end_disabled()
+            imgui.text(f"Selected camera: {self._camera_index} / {num_cameras}")
+        else:
+            imgui.begin_disabled(True)
+            imgui.checkbox("Go To Frustum", self._go_to_frustum)
+            imgui.slider_int("Camera #", self._camera_index, 1, 1)
+            imgui.end_disabled()
+            imgui.text_disabled("Load a dataset with cameras to enable frustum navigation")
 
         imgui.separator()
 
@@ -85,6 +130,10 @@ class TrainerPanel(Panel):
             imgui.end_disabled()
             if not has_colmap:
                 imgui.text_disabled("Load a dataset to enable training")
+
+            if imgui.button("Reset Training", imgui.ImVec2(imgui.get_content_region_avail().x, 0)):
+                self.trainer.reset()
+                logger.info("Training reset requested")
 
         imgui.separator()
 

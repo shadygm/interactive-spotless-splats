@@ -5,8 +5,10 @@ import numpy as np
 import torch
 from loguru import logger
 
+from viewer.camera.state import CameraState
 from viewer.scene.bounds import compute_scene_bounds
 from viewer.scene.frustums import build_camera_frustums
+from viewer.scene.coordinate_system import qvec2rotmat
 from viewer.scene.point_cloud import extract_point_cloud
 from viewer.scene.loaders import ColmapLoader, PlyLoader, TransformsJsonLoader
 from viewer.scene.gaussian_data import build_axis_gaussians
@@ -129,6 +131,18 @@ class SceneState:
                 "sh_degree": self.gaussians["sh_degree"],
             }
 
+    def clear_gaussians(self):
+        """Remove all gaussians from the scene.
+
+        The renderer already treats a None gaussian buffer as empty, so this is a
+        safe way to clear the learned splat state after stopping training.
+        """
+        with self._lock:
+            self.gaussians = None
+            self.has_gaussians = False
+            self._default_gaussians = False
+            self._bump_version()
+
     def has_learned_gaussians(self):
         """Return True when a non-default splat set is present.
 
@@ -153,6 +167,112 @@ class SceneState:
             return build_camera_frustums(
                 self.colmap_images, self.colmap_cameras, render_settings, scene_scale
             )
+
+    def get_ordered_camera_ids(self) -> list[int]:
+        with self._lock:
+            return sorted(self.colmap_images.keys()) if self.colmap_images else []
+
+    def get_camera_count(self) -> int:
+        with self._lock:
+            return len(self.colmap_images) if self.colmap_images else 0
+
+    def get_camera_state_by_index(self, index: int) -> CameraState | None:
+        """Return the Nth dataset camera as a viewport camera state."""
+        with self._lock:
+            if not self.has_colmap or not self.colmap_images or not self.colmap_cameras:
+                return None
+
+            image_ids = sorted(self.colmap_images.keys())
+            if not image_ids:
+                return None
+
+            index = int(np.clip(index, 0, len(image_ids) - 1))
+            image = self.colmap_images[image_ids[index]]
+            camera = self.colmap_cameras.get(image["camera_id"])
+            if camera is None:
+                return None
+
+            R = qvec2rotmat(image["qvec"])
+            tvec = np.asarray(image["tvec"], dtype=np.float64)
+            position = (-R.T @ tvec).astype(np.float32)
+            forward = (-R.T[:, 2]).astype(np.float32)
+            forward /= np.linalg.norm(forward) + 1e-8
+
+            yaw = float(np.arctan2(forward[2], forward[0]))
+            pitch = float(np.arcsin(np.clip(forward[1], -1.0, 1.0)))
+
+            params = np.asarray(camera.get("params", []), dtype=np.float64)
+            width = float(camera.get("width", 1))
+            fov = 45.0
+            if params.size >= 1:
+                if camera.get("model") == 1 and params.size >= 2:
+                    focal = 0.5 * (float(params[0]) + float(params[1]))
+                else:
+                    focal = float(params[0])
+                if focal > 1e-8:
+                    fov = float(np.degrees(2.0 * np.arctan(width / (2.0 * focal))))
+
+            return CameraState(
+                position=position,
+                yaw=yaw,
+                pitch=pitch,
+                fov=fov,
+                source_mode="fps",
+            )
+
+    def get_camera_pose_by_index(self, index: int) -> dict | None:
+        """Return the exact dataset pose and intrinsics for the Nth camera."""
+        with self._lock:
+            if not self.has_colmap or not self.colmap_images or not self.colmap_cameras:
+                return None
+
+            image_ids = sorted(self.colmap_images.keys())
+            if not image_ids:
+                return None
+
+            index = int(np.clip(index, 0, len(image_ids) - 1))
+            image = self.colmap_images[image_ids[index]]
+            camera = self.colmap_cameras.get(image["camera_id"])
+            if camera is None:
+                return None
+
+            R = qvec2rotmat(image["qvec"])
+            tvec = np.asarray(image["tvec"], dtype=np.float64)
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :3] = R.T.astype(np.float32)
+            c2w[:3, 3] = (-R.T @ tvec).astype(np.float32)
+
+            params = np.asarray(camera.get("params", []), dtype=np.float64)
+            width = int(camera.get("width", 1))
+            height = int(camera.get("height", 1))
+
+            if camera.get("model") == 1 and params.size >= 4:
+                fx, fy, cx, cy = map(float, params[:4])
+            elif camera.get("model") == 2 and params.size >= 4:
+                f, cx, cy = map(float, params[:3])
+                fx = fy = f
+            else:
+                fx = fy = float(params[0]) if params.size >= 1 else float(width)
+                cx = float(params[1]) if params.size >= 2 else width / 2.0
+                cy = float(params[2]) if params.size >= 3 else height / 2.0
+
+            K = np.array(
+                [
+                    [fx, 0.0, cx],
+                    [0.0, fy, cy],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+
+            return {
+                "c2w": c2w,
+                "K": K,
+                "width": width,
+                "height": height,
+                "name": image.get("name", ""),
+                "camera_id": image.get("camera_id", -1),
+            }
 
     def get_point_cloud(self):
         """Return (xyz, rgb) numpy arrays from colmap_points3D."""

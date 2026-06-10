@@ -1,12 +1,14 @@
 from viewer.ui.panels import ScenePanel, RenderSettingsPanel
 from viewer.ui.trainer_panel import TrainerPanel
+from viewer.ui.spotless_panel import SpotlessPanel
 
 
 class UIManager:
-    def __init__(self, scene_state, renderer, render_settings, camera=None, trainer=None):
+    def __init__(self, scene_state, renderer, render_settings, camera=None, trainer=None, on_go_to_frustum=None):
         self.scene_panel = ScenePanel(scene_state, renderer, render_settings)
         self.render_settings_panel = RenderSettingsPanel(render_settings, camera, scene_state)
-        self.trainer_panel = TrainerPanel(trainer, scene_state) if trainer else None
+        self.trainer_panel = TrainerPanel(trainer, scene_state, on_go_to_frustum=on_go_to_frustum) if trainer else None
+        self.spotless_panel = SpotlessPanel(trainer, scene_state) if trainer else None
         self._camera = camera
 
     @property
@@ -27,6 +29,10 @@ class UIManager:
     def draw_trainer_panel(self):
         if self.trainer_panel:
             self.trainer_panel.draw()
+
+    def draw_spotless_panel(self):
+        if self.spotless_panel:
+            self.spotless_panel.draw()
 
     @property
     def pending_dataset_path(self):
@@ -50,8 +56,8 @@ class UIManager:
 class UI:
     """Backward-compatible UI wrapper that delegates to UIManager."""
 
-    def __init__(self, scene_state, renderer, render_settings, camera=None, trainer=None):
-        self._manager = UIManager(scene_state, renderer, render_settings, camera, trainer)
+    def __init__(self, scene_state, renderer, render_settings, camera=None, trainer=None, on_go_to_frustum=None):
+        self._manager = UIManager(scene_state, renderer, render_settings, camera, trainer, on_go_to_frustum)
         self._camera = camera
 
     @property
@@ -71,6 +77,9 @@ class UI:
 
     def draw_trainer(self):
         return self._manager.draw_trainer_panel()
+
+    def draw_spotless(self):
+        return self._manager.draw_spotless_panel()
 
     @property
     def pending_dataset_path(self):

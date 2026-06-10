@@ -18,5 +18,14 @@ FPSCamera = _package.FPSCamera
 CameraState = _package.CameraState
 compute_camera_basis = _package.compute_camera_basis
 create_camera = _package.create_camera
+DatasetCamera = _package.DatasetCamera
 
-__all__ = ["Camera", "OrbitCamera", "FPSCamera", "CameraState", "compute_camera_basis", "create_camera"]
+__all__ = [
+    "Camera",
+    "OrbitCamera",
+    "FPSCamera",
+    "DatasetCamera",
+    "CameraState",
+    "compute_camera_basis",
+    "create_camera",
+]

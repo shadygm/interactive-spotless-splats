@@ -18,6 +18,11 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import MCMCStrategy, DefaultStrategy
 from gsplat import export_splats
 from viewer.scene.loaders import _load_point_cloud_records
+from trainer.spotless.dataset import build_semantic_feature_manifest, load_semantic_features
+from trainer.spotless.encoding import get_positional_encodings, get_positional_encodings_from_coords
+from trainer.spotless.mask import robust_cluster_mask, robust_mask
+from trainer.spotless.mlp import SpotLessModule
+from trainer.spotless.stats import RunningStats
 
 
 # ---------------------------------------------------------------------------
@@ -194,13 +199,66 @@ def _quat_from_matrix(R: np.ndarray) -> np.ndarray:
         z = 0.25 * s
     return np.array([w, x, y, z], dtype=np.float32)
 
+
+def _discover_semantic_shape(
+    image_paths: list[str],
+    dataset_root: str | None = None,
+    prefer_clustered: bool = False,
+) -> tuple[int, ...] | None:
+    if dataset_root is not None:
+        images_dir = os.path.join(dataset_root, "images")
+        if os.path.isdir(images_dir):
+            candidates = sorted(Path(images_dir).glob("*_sdfeats*.npy"))
+            if prefer_clustered:
+                candidates = sorted(candidates, key=lambda p: (0 if "clustered" in p.stem else 1, p.name))
+            if candidates:
+                logger.info(
+                    f"Spotless semantic discovery: probing {candidates[0]} "
+                    f"({len(candidates)} candidates under {images_dir})"
+                )
+            for candidate in candidates:
+                try:
+                    features = np.load(candidate)
+                    logger.info(
+                        f"Spotless semantic discovery: loaded {candidate} "
+                        f"with shape={tuple(features.shape)} dtype={features.dtype}"
+                    )
+                    return tuple(features.shape)
+                except Exception as exc:
+                    logger.warning(f"Spotless semantic discovery: failed to load {candidate}: {exc}")
+
+    for image_path in image_paths:
+        try:
+            features, candidate, feature_kind = load_semantic_features(
+                image_path,
+                dataset_root=dataset_root,
+                prefer_clustered=prefer_clustered,
+            )
+            if features is not None:
+                logger.info(
+                    f"Spotless semantic discovery: loaded {candidate} "
+                    f"for {image_path} (kind={feature_kind}, shape={tuple(features.shape)})"
+                )
+                return tuple(features.shape)
+        except Exception as exc:
+                logger.warning(f"Spotless semantic discovery: failed to load features for {image_path}: {exc}")
+    return None
+
+
+def _resize_image_if_needed(image: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
+    """Resize image to target (width, height) if it differs from the current size."""
+    target_w, target_h = target_size
+    if image.shape[1] == target_w and image.shape[0] == target_h:
+        return image
+    return cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
 class _SimpleColmapParser:
     """Minimal COLMAP parser using pycolmap 4.x API."""
 
     def __init__(self, data_dir: str, factor: int = 1, test_every: int = 8):
         import pycolmap
 
-        self.data_dir = data_dir
+        self.data_dir = os.path.abspath(data_dir)
         self.factor = factor
         self.test_every = test_every
 
@@ -297,8 +355,16 @@ class _SimpleColmapParser:
             pt = rec.points3D[pt_id]
             points_list.append(pt.xyz)
             colors_list.append(pt.color)
-        self.points = np.array(points_list, dtype=np.float32)
-        self.points_rgb = np.array(colors_list, dtype=np.uint8)
+        if len(points_list) == 0:
+            logger.warning(
+                f"No COLMAP point cloud was found in {sparse_dir}; creating 1000 fallback points in a 5x5x5 box"
+            )
+            rng = np.random.default_rng(42)
+            self.points = rng.uniform(-2.5, 2.5, size=(1000, 3)).astype(np.float32)
+            self.points_rgb = rng.integers(96, 256, size=(1000, 3), dtype=np.uint8)
+        else:
+            self.points = np.array(points_list, dtype=np.float32)
+            self.points_rgb = np.array(colors_list, dtype=np.uint8)
 
         # Scene scale
         camera_locations = self.camtoworlds[:, :3, 3]
@@ -314,14 +380,21 @@ class _SimpleColmapDataset(torch.utils.data.Dataset):
     The DataLoader workers handle prefetching. This matches simple_trainer.py.
     """
 
-    def __init__(self, parser: _SimpleColmapParser, split: str = "train"):
+    def __init__(self, parser: _SimpleColmapParser, split: str = "train", prefer_clustered: bool = False):
         self.parser = parser
         self.split = split
+        self.prefer_clustered = prefer_clustered
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
+        self.semantic_feature_paths, self.semantic_preview_paths, self.semantic_shape = build_semantic_feature_manifest(
+            self.parser.image_paths,
+            dataset_root=self.parser.data_dir,
+            prefer_clustered=self.prefer_clustered,
+        )
+        self.has_semantics = self.semantic_shape is not None
 
     def __len__(self):
         return len(self.indices)
@@ -337,6 +410,7 @@ class _SimpleColmapDataset(torch.utils.data.Dataset):
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy().astype(np.float32)
         camtoworld = self.parser.camtoworlds[index].copy()
+        image = _resize_image_if_needed(image, self.parser.imsize_dict[camera_id])
 
         data = {
             "K": torch.from_numpy(K),
@@ -344,7 +418,18 @@ class _SimpleColmapDataset(torch.utils.data.Dataset):
             "image": torch.from_numpy(image),
             "image_id": item,
             "camera_idx": self.parser.camera_indices[index],
+            "semantic_preview_path": str(self.semantic_preview_paths[index]) if self.semantic_preview_paths[index] is not None else None,
         }
+        if self.has_semantics:
+            feature_path = self.semantic_feature_paths[index]
+            if feature_path is None:
+                features = torch.zeros(self.semantic_shape, dtype=torch.float32)
+                semantics_valid = False
+            else:
+                features = torch.from_numpy(np.load(feature_path).copy())
+                semantics_valid = True
+            data["semantics"] = features.float()
+            data["semantics_valid"] = torch.tensor(semantics_valid, dtype=torch.bool)
         return data
 
 
@@ -355,12 +440,13 @@ class _SimpleColmapDataset(torch.utils.data.Dataset):
 class _TransformsJsonParser:
     """Parse transforms.json dataset for training."""
 
-    def __init__(self, data_dir: str, factor: int = 1, test_every: int = 8):
+    def __init__(self, data_dir: str, factor: int = 1, test_every: int = 8, prefer_clustered: bool = False):
         import json
 
-        self.data_dir = data_dir
+        self.data_dir = os.path.abspath(data_dir)
         self.factor = factor
         self.test_every = test_every
+        self.prefer_clustered = prefer_clustered
 
         transforms_path = os.path.join(data_dir, "transforms.json")
         with open(transforms_path, "r") as f:
@@ -379,6 +465,10 @@ class _TransformsJsonParser:
         self.camera_id_to_idx = {}
         self.transform = np.eye(4, dtype=np.float64)
         self.transform_inv = np.eye(4, dtype=np.float64)
+        self.has_semantics = False
+        self.semantic_shape: tuple[int, ...] | None = None
+        self.semantic_feature_paths: list[Optional[Path]] = []
+        self.semantic_preview_paths: list[Optional[Path]] = []
 
         # Collect image data
         image_names = []
@@ -458,6 +548,12 @@ class _TransformsJsonParser:
         self.image_paths = [image_paths[i] for i in inds]
         self.camtoworlds = camtoworlds[inds].astype(np.float32)
         self.camera_ids = [self.camera_ids[i] for i in inds]
+        self.semantic_feature_paths, self.semantic_preview_paths, self.semantic_shape = build_semantic_feature_manifest(
+            self.image_paths,
+            dataset_root=self.data_dir,
+            prefer_clustered=self.prefer_clustered,
+        )
+        self.has_semantics = self.semantic_shape is not None
 
         # Create 0-based contiguous camera indices
         unique_camera_ids = sorted(set(self.camera_ids))
@@ -507,6 +603,7 @@ class _TransformsJsonDataset(torch.utils.data.Dataset):
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy().astype(np.float32)
         camtoworld = self.parser.camtoworlds[index].copy()
+        image = _resize_image_if_needed(image, self.parser.imsize_dict[camera_id])
 
         # Undistort if distortion maps are present
         if camera_id in self.parser.undist_mapx:
@@ -525,7 +622,18 @@ class _TransformsJsonDataset(torch.utils.data.Dataset):
             "image": torch.from_numpy(image),
             "image_id": item,
             "camera_idx": self.parser.camera_indices[index],
+            "semantic_preview_path": str(self.parser.semantic_preview_paths[index]) if self.parser.semantic_preview_paths[index] is not None else None,
         }
+        if self.parser.has_semantics:
+            feature_path = self.parser.semantic_feature_paths[index]
+            if feature_path is None:
+                features = torch.zeros(self.parser.semantic_shape, dtype=torch.float32)
+                semantics_valid = False
+            else:
+                features = torch.from_numpy(np.load(feature_path).copy())
+                semantics_valid = True
+            data["semantics"] = features.float()
+            data["semantics_valid"] = torch.tensor(semantics_valid, dtype=torch.bool)
         return data
 
 
@@ -537,6 +645,9 @@ def _knn(x: torch.Tensor, K: int = 4) -> torch.Tensor:
     """kNN using scikit-learn KD-tree (fast, low memory)."""
     from sklearn.neighbors import NearestNeighbors
 
+    if x.shape[0] == 0:
+        return torch.empty((0, K), dtype=x.dtype, device=x.device)
+    K = min(K, x.shape[0])
     x_np = x.cpu().numpy()
     model = NearestNeighbors(n_neighbors=K, metric="euclidean").fit(x_np)
     distances, _ = model.kneighbors(x_np)
@@ -565,8 +676,25 @@ def _ssim(img1: torch.Tensor, img2: torch.Tensor, window_size: int = 11) -> torc
     return ssim_map.mean()
 
 
-# Compile SSIM for speed (low-overhead mode for small graphs)
-_compiled_ssim = torch.compile(_ssim, mode="reduce-overhead", dynamic=False, fullgraph=False)
+_compiled_ssim = None
+
+
+def _get_compiled_ssim():
+    global _compiled_ssim
+    if _compiled_ssim is None:
+        # Keep SSIM uncompiled so repeated stop/reset/start cycles do not trip
+        # over stale torch.compile / cudagraph state.
+        _compiled_ssim = _ssim
+    return _compiled_ssim
+
+
+def _reset_compiled_ssim():
+    global _compiled_ssim
+    _compiled_ssim = None
+    try:
+        torch._dynamo.reset()
+    except Exception:
+        pass
 
 
 def _rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
@@ -586,12 +714,24 @@ def _create_splats_and_optimizers(
     points = torch.from_numpy(parser.points).float()
     rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
 
-    # Initialize scales from kNN distances
-    dist2_avg = (_knn(points, 4)[:, 1:] ** 2).mean(dim=-1)
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)
-
     N = points.shape[0]
+    if N == 0:
+        logger.warning(
+            "Empty point cloud reached splat initialization; creating 1000 fallback points in a 5x5x5 box"
+        )
+        rng = np.random.default_rng(42)
+        points = torch.from_numpy(rng.uniform(-2.5, 2.5, size=(1000, 3)).astype(np.float32)).float()
+        rgbs = torch.from_numpy(rng.integers(96, 256, size=(1000, 3), dtype=np.uint8) / 255.0).float()
+        N = 1000
+
+    if N >= 2:
+        # Initialize scales from kNN distances
+        dist2_avg = (_knn(points, 4)[:, 1:] ** 2).mean(dim=-1)
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(torch.clamp(dist_avg * init_scale, min=1e-6)).unsqueeze(-1).repeat(1, 3)
+    else:
+        scales = torch.full((N, 3), math.log(max(init_scale, 1e-6)), dtype=torch.float32)
+
     quats = torch.rand((N, 4))
     opacities = torch.logit(torch.full((N,), init_opacity))
 
@@ -632,9 +772,18 @@ class TrainerConfig:
     max_splats: int = 1_000_000
     num_iterations: int = 30_000
     ssim_lambda: float = 0.2
+    loss_type: str = "l1"
+    semantics: bool = False
+    cluster: bool = False
+    robust_percentile: float = 0.7
+    schedule: bool = True
+    schedule_beta: float = -3e-3
+    lower_bound: float = 0.5
+    upper_bound: float = 0.9
+    bin_size: int = 10000
     sh_degree: int = 3
     batch_size: int = 1
-    data_factor: int = 4
+    data_factor: int = 1
     test_every: int = 8
     device: str = "cuda"
     strategy: str = "mcmc"  # "mcmc" or "default"
@@ -670,6 +819,22 @@ class Trainer:
         self._trainloader_iter = None
         self._scheduler = None
         self._parser = None
+        self._spotless_module = None
+        self._spotless_optimizer = None
+        self._spotless_chunk_size = 8192
+        self._spotless_snapshot: Optional[Dict[str, Any]] = None
+        self._spotless_snapshot_step = -1
+        self._step_condition = threading.Condition()
+        self._step_mode_enabled = False
+        self._step_requests = 0
+        self._semantics_available = False
+        self._spotless_active = False
+        self.running_stats = RunningStats(
+            bin_size=self.config.bin_size,
+            robust_percentile=self.config.robust_percentile,
+            lower_bound=self.config.lower_bound,
+            upper_bound=self.config.upper_bound,
+        )
 
     def start(self, colmap_path: str):
         """Start training in a background thread."""
@@ -677,10 +842,25 @@ class Trainer:
             logger.warning("Trainer already running")
             return
 
+        _reset_compiled_ssim()
         self._stop_event.clear()
         self.loss_history.clear()
         self.current_iteration = 0
         self.status_message = "Initializing..."
+        self._spotless_snapshot = None
+        self._spotless_snapshot_step = -1
+        self._spotless_module = None
+        self._spotless_optimizer = None
+        self._semantics_available = False
+        self._spotless_active = False
+        self.running_stats = RunningStats(
+            bin_size=self.config.bin_size,
+            robust_percentile=self.config.robust_percentile,
+            lower_bound=self.config.lower_bound,
+            upper_bound=self.config.upper_bound,
+        )
+        with self._step_condition:
+            self._step_requests = 0
 
         self._thread = threading.Thread(
             target=self._train_loop, args=(colmap_path,), daemon=True
@@ -692,11 +872,77 @@ class Trainer:
         if not self.is_running:
             return
         self._stop_event.set()
+        with self._step_condition:
+            self._step_condition.notify_all()
         self.status_message = "Stopping..."
         if self._thread:
             self._thread.join(timeout=5.0)
         self.is_running = False
         self.status_message = "Stopped"
+
+    def reset(self):
+        """Clear all training state and remove learned gaussians from the scene."""
+        if self.is_running:
+            logger.warning("Cannot reset training while it is running; stop it first")
+            return
+
+        _reset_compiled_ssim()
+        with self._lock:
+            self._splats = None
+            self._optimizers = None
+            self._strategy = None
+            self._strategy_state = None
+            self._trainloader = None
+            self._trainloader_iter = None
+            self._scheduler = None
+            self._parser = None
+            self._spotless_module = None
+            self._spotless_optimizer = None
+            self._spotless_snapshot = None
+            self._spotless_snapshot_step = -1
+            self.loss_history.clear()
+            self.current_iteration = 0
+            self.current_splats = 0
+            self.status_message = "Reset"
+            self._step_mode_enabled = False
+            self._step_requests = 0
+        self.running_stats = RunningStats(
+            bin_size=self.config.bin_size,
+            robust_percentile=self.config.robust_percentile,
+            lower_bound=self.config.lower_bound,
+            upper_bound=self.config.upper_bound,
+        )
+        self.scene_state.clear_gaussians()
+        logger.info("Training state reset; learned gaussians cleared")
+
+    def set_step_mode(self, enabled: bool):
+        with self._step_condition:
+            self._step_mode_enabled = enabled
+            if not enabled:
+                self._step_condition.notify_all()
+
+    def request_next_step(self):
+        with self._step_condition:
+            self._step_requests += 1
+            self._step_condition.notify_all()
+
+    def get_spotless_snapshot(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if self._spotless_snapshot is None:
+                return None
+            snapshot = dict(self._spotless_snapshot)
+        return snapshot
+
+    def _wait_for_step_request(self):
+        with self._step_condition:
+            while self._step_mode_enabled and self._step_requests <= 0 and not self._stop_event.is_set():
+                self.status_message = "Paused"
+                self._step_condition.wait(timeout=0.1)
+            if self._stop_event.is_set():
+                return False
+            if self._step_requests > 0:
+                self._step_requests -= 1
+        return True
 
     def _train_loop(self, colmap_path: str):
         try:
@@ -724,6 +970,7 @@ class Trainer:
                     data_dir=colmap_path,
                     factor=cfg.data_factor,
                     test_every=cfg.test_every,
+                    prefer_clustered=cfg.cluster,
                 )
                 trainset = _TransformsJsonDataset(parser, split="train")
             else:
@@ -733,8 +980,24 @@ class Trainer:
                     factor=cfg.data_factor,
                     test_every=cfg.test_every,
                 )
-                trainset = _SimpleColmapDataset(parser, split="train")
+                trainset = _SimpleColmapDataset(parser, split="train", prefer_clustered=cfg.cluster)
             self._parser = parser
+            images_dir = os.path.join(parser.data_dir, "images")
+            raw_count = 0
+            clustered_count = 0
+            if os.path.isdir(images_dir):
+                raw_count = len(list(Path(images_dir).glob("*_sdfeats.npy")))
+                clustered_count = len(list(Path(images_dir).glob("*_sdfeats_clustered.npy")))
+            self._semantics_available = (raw_count + clustered_count) > 0
+            if self._semantics_available and not cfg.semantics:
+                cfg.semantics = True
+                logger.info("Auto-enabled spotless semantics because feature files were found")
+            if cfg.semantics and not self._semantics_available:
+                logger.warning(
+                    "Spotless semantics requested but no feature files were found "
+                    f"under {images_dir} (raw={raw_count}, clustered={clustered_count})"
+                )
+                cfg.semantics = False
 
             scene_scale = parser.scene_scale * 1.1
 
@@ -744,6 +1007,30 @@ class Trainer:
             )
             logger.info(f"Initialized {len(self._splats['means'])} splats from point cloud")
             logger.info(f"[TRAINER] Splats device: {self._splats['means'].device}")
+            self._spotless_active = cfg.semantics and self._semantics_available
+            if self._spotless_active and not cfg.cluster:
+                semantic_shape = getattr(trainset, "semantic_shape", None)
+                if semantic_shape is None:
+                    logger.warning("Spotless semantics are enabled but no feature shape could be inferred")
+                    self._spotless_active = False
+                else:
+                    if len(semantic_shape) < 3:
+                        logger.warning(f"Invalid semantic feature shape: {semantic_shape}")
+                        self._spotless_active = False
+                    else:
+                        semantic_channels = int(semantic_shape[0])
+                        self._spotless_module = SpotLessModule(
+                            num_features=semantic_channels + 80,
+                            num_classes=1,
+                        ).to(device)
+                        self._spotless_optimizer = torch.optim.Adam(
+                            self._spotless_module.parameters(),
+                            lr=1e-3,
+                        )
+                        logger.info(
+                            f"Initialized SpotLessModule with {semantic_channels} feature channels "
+                            f"({semantic_channels + 80} with positional encoding)"
+                        )
 
             # Setup strategy
             if cfg.strategy == "mcmc":
@@ -770,15 +1057,15 @@ class Trainer:
                 self._optimizers["means"], gamma=0.01 ** (1.0 / cfg.num_iterations)
             )
 
-            # DataLoader: use num_workers>0 for prefetching and pin_memory
-            # for faster async CPU->GPU transfers. persistent_workers avoids
-            # process spawn overhead across epochs.
+            # DataLoader: keep a few workers alive for prefetching and to
+            # avoid serializing image/feature loads on the training thread.
+            num_workers = 4
             loader_kwargs = {
                 "batch_size": cfg.batch_size,
                 "shuffle": True,
-                "num_workers": 4,
-                "persistent_workers": True,
-                "pin_memory": True,
+                "num_workers": num_workers,
+                "persistent_workers": num_workers > 0,
+                "pin_memory": num_workers > 0,
             }
             self._trainloader = torch.utils.data.DataLoader(trainset, **loader_kwargs)
             self._trainloader_iter = iter(self._trainloader)
@@ -787,6 +1074,8 @@ class Trainer:
             self._train_start_time = time.time()
             for step in range(cfg.num_iterations):
                 if self._stop_event.is_set():
+                    break
+                if self._step_mode_enabled and not self._wait_for_step_request():
                     break
 
                 t_data_start = time.time()
@@ -836,14 +1125,203 @@ class Trainer:
                 )
 
                 colors_render = renders[..., :3]
+                error_per_pixel = torch.abs(colors_render - pixels)
+                use_spotless = bool(cfg.semantics and self._semantics_available)
+                semantics_valid = data.get("semantics_valid", None)
+                if semantics_valid is not None:
+                    if torch.is_tensor(semantics_valid):
+                        if not bool(torch.all(semantics_valid).item()):
+                            use_spotless = False
+                    elif not bool(semantics_valid):
+                        use_spotless = False
 
-                # Loss: SSIM + L1
-                l1loss = F.l1_loss(colors_render, pixels)
-                ssimloss = 1.0 - _compiled_ssim(
-                    colors_render.permute(0, 3, 1, 2),
-                    pixels.permute(0, 3, 1, 2),
-                )
-                loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+                pred_mask = None
+                pred_mask_up = None
+                lower_mask = None
+                upper_mask = None
+                loss_map = None
+                semantic_features = None
+                semantic_features_snapshot = None
+                semantic_preview_path = data.get("semantic_preview_path")
+                semantic_kind = None
+                raw_spotless_chunked = False
+                publish_snapshot = (step == 0) or self._step_mode_enabled or ((step + 1) % 25 == 0)
+
+                if cfg.loss_type == "robust" or use_spotless:
+                    pred_mask = robust_mask(error_per_pixel, self.running_stats.avg_err)
+                    if use_spotless:
+                        semantic_features = data.get("semantics")
+                        if semantic_features is not None:
+                            semantic_features_snapshot = semantic_features
+                            semantic_features = semantic_features.to(device, non_blocking=True).float()
+                            if semantic_features.ndim == 3:
+                                semantic_features = semantic_features.unsqueeze(0)
+                            if cfg.cluster:
+                                semantic_kind = "clustered"
+                                semantic_features = F.interpolate(
+                                    semantic_features,
+                                    size=(height, width),
+                                    mode="nearest",
+                                )
+                                pred_mask = robust_cluster_mask(pred_mask, semantic_features)
+                            else:
+                                semantic_kind = "raw"
+                                if self._spotless_module is None:
+                                    semantic_channels = int(semantic_features.shape[1])
+                                    self._spotless_module = SpotLessModule(
+                                        num_features=semantic_channels + 80,
+                                        num_classes=1,
+                                    ).to(device)
+                                    self._spotless_optimizer = torch.optim.Adam(
+                                        self._spotless_module.parameters(),
+                                        lr=1e-3,
+                                    )
+                                    logger.info(
+                                        f"Lazily initialized SpotLessModule with {semantic_channels} feature channels"
+                                    )
+                                if self._spotless_module is not None:
+                                    raw_spotless_chunked = True
+                                    lower_mask = robust_mask(
+                                        error_per_pixel, self.running_stats.lower_err
+                                    )
+                                    upper_mask = robust_mask(
+                                        error_per_pixel, self.running_stats.upper_err
+                                    )
+                                    pixel_count = height * width
+                                    chunk_size = min(self._spotless_chunk_size, pixel_count)
+                                    flat_error = error_per_pixel.reshape(-1, error_per_pixel.shape[-1])
+                                    flat_lower = lower_mask.reshape(-1, 1)
+                                    flat_upper = upper_mask.reshape(-1, 1)
+                                    rgb_loss_sum = torch.zeros((), device=device)
+                                    spot_loss_sum = torch.zeros((), device=device)
+                                    loss_map_chunks: list[torch.Tensor] = []
+                                    pred_mask_chunks: list[torch.Tensor] = []
+
+                                    self._spotless_module.eval()
+                                    for start in range(0, pixel_count, chunk_size):
+                                        end = min(start + chunk_size, pixel_count)
+                                        idx = torch.arange(start, end, device=device)
+                                        ys = torch.div(idx, width, rounding_mode="floor")
+                                        xs = idx % width
+                                        grid_x = ((xs.to(torch.float32) + 0.5) / float(width)) * 2.0 - 1.0
+                                        grid_y = ((ys.to(torch.float32) + 0.5) / float(height)) * 2.0 - 1.0
+                                        grid = torch.stack([grid_x, grid_y], dim=-1).view(1, -1, 1, 2)
+
+                                        sampled_features = F.grid_sample(
+                                            semantic_features,
+                                            grid,
+                                            mode="bilinear",
+                                            align_corners=False,
+                                        )
+                                        sampled_features = sampled_features.squeeze(0).squeeze(-1).transpose(0, 1)
+                                        pos_enc = get_positional_encodings_from_coords(
+                                            xs,
+                                            ys,
+                                            height,
+                                            width,
+                                            20,
+                                        )
+                                        spotless_input = torch.cat([sampled_features, pos_enc], dim=-1)
+                                        pred_chunk = self._spotless_module(spotless_input)
+
+                                        if publish_snapshot:
+                                            pred_mask_chunks.append(pred_chunk.detach().cpu())
+
+                                        sampled_mask = pred_chunk.detach()
+                                        if cfg.schedule:
+                                            alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
+                                            sampled_mask = torch.bernoulli(
+                                                torch.clip(
+                                                    alpha + (1 - alpha) * sampled_mask,
+                                                    min=0.0,
+                                                    max=1.0,
+                                                )
+                                            )
+
+                                        lower_chunk = flat_lower[start:end]
+                                        upper_chunk = flat_upper[start:end]
+                                        err_chunk = flat_error[start:end]
+                                        if publish_snapshot:
+                                            loss_map_chunks.append(
+                                                torch.mean((sampled_mask * err_chunk).detach().cpu(), dim=-1, keepdim=True)
+                                            )
+                                        spot_loss_sum = spot_loss_sum + (
+                                            F.relu(pred_chunk - lower_chunk) + F.relu(upper_chunk - pred_chunk)
+                                        ).sum()
+
+                                        rgb_loss_sum = rgb_loss_sum + (sampled_mask * err_chunk).sum()
+
+                                    pred_mask = torch.cat(pred_mask_chunks, dim=0).reshape(1, height, width, 1) if pred_mask_chunks else None
+                                    loss_map = (
+                                        torch.cat(loss_map_chunks, dim=0).reshape(1, height, width, 1)
+                                        if loss_map_chunks
+                                        else None
+                                    )
+                                    rgbloss = rgb_loss_sum / float(pixel_count * error_per_pixel.shape[-1])
+                                    spot_loss = spot_loss_sum / float(pixel_count)
+                                    spot_loss = spot_loss + 0.5 * self._spotless_module.get_regularizer()
+                    if not raw_spotless_chunked:
+                        if cfg.schedule:
+                            alpha = np.exp(cfg.schedule_beta * np.floor((1 + step) / 1.5))
+                            pred_mask = torch.bernoulli(
+                                torch.clip(
+                                    alpha + (1 - alpha) * pred_mask.detach(),
+                                    min=0.0,
+                                    max=1.0,
+                                )
+                            )
+                        if pred_mask is not None:
+                            masked_error = pred_mask.detach() * error_per_pixel
+                            rgbloss = masked_error.mean()
+                            loss_map = torch.mean(masked_error, dim=-1, keepdim=True)
+                        else:
+                            rgbloss = error_per_pixel.mean()
+                            loss_map = torch.mean(error_per_pixel, dim=-1, keepdim=True)
+                    elif loss_map is None:
+                        if pred_mask is not None:
+                            loss_map = torch.mean(pred_mask.detach() * error_per_pixel, dim=-1, keepdim=True)
+                        else:
+                            loss_map = torch.mean(error_per_pixel, dim=-1, keepdim=True)
+                else:
+                    # Loss: SSIM + L1
+                    l1loss = F.l1_loss(colors_render, pixels)
+                    ssimloss = 1.0 - _get_compiled_ssim()(
+                        colors_render.permute(0, 3, 1, 2),
+                        pixels.permute(0, 3, 1, 2),
+                    )
+                    rgbloss = l1loss
+                    loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+                    loss_map = torch.mean(error_per_pixel, dim=-1, keepdim=True)
+
+                if cfg.loss_type == "robust" or use_spotless:
+                    ssimloss = 1.0 - _get_compiled_ssim()(
+                        colors_render.permute(0, 3, 1, 2),
+                        pixels.permute(0, 3, 1, 2),
+                    )
+                    loss = rgbloss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+                if raw_spotless_chunked:
+                    self._spotless_module.train()
+                else:
+                    spot_loss = None
+
+                if publish_snapshot:
+                    error_map = loss_map if loss_map is not None else torch.mean(error_per_pixel, dim=-1, keepdim=True)
+                    semantic_preview_path = data.get("semantic_preview_path")
+                    if isinstance(semantic_preview_path, (list, tuple)) and semantic_preview_path:
+                        semantic_preview_path = semantic_preview_path[0]
+                    self._publish_spotless_snapshot(
+                        step=step + 1,
+                        pixels=pixels,
+                        colors_render=colors_render,
+                        pred_mask=pred_mask,
+                        error_map=error_map,
+                        semantic_features=semantic_features_snapshot,
+                        semantic_preview_path=semantic_preview_path,
+                        semantic_kind=semantic_kind,
+                        loss=float(loss.item()),
+                        spot_loss=float(spot_loss.item()) if spot_loss is not None else None,
+                    )
 
                 # Strategy pre-backward (DefaultStrategy only)
                 if isinstance(self._strategy, DefaultStrategy):
@@ -857,11 +1335,16 @@ class Trainer:
 
                 # Backward
                 loss.backward()
+                if spot_loss is not None and self._spotless_optimizer is not None:
+                    spot_loss.backward()
 
                 # Optimize
                 for optimizer in self._optimizers.values():
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                if self._spotless_optimizer is not None:
+                    self._spotless_optimizer.step()
+                    self._spotless_optimizer.zero_grad(set_to_none=True)
                 self._scheduler.step()
 
                 # Strategy post-backward
@@ -883,6 +1366,14 @@ class Trainer:
                         info=info,
                         packed=False,
                     )
+
+                if cfg.loss_type == "robust" or use_spotless:
+                    info["err"] = torch.histogram(
+                        torch.mean(error_per_pixel, dim=-1).detach().cpu(),
+                        bins=cfg.bin_size,
+                        range=(0.0, 1.0),
+                    )[0]
+                    self.running_stats.update(info["err"])
 
                 self.current_iteration = step + 1
                 self.current_splats = len(self._splats['means'])
@@ -1010,3 +1501,39 @@ class Trainer:
             save_to=ply_path,
         )
         logger.info(f"Saved PLY to {ply_path}")
+
+    def _publish_spotless_snapshot(
+        self,
+        *,
+        step: int,
+        pixels: torch.Tensor,
+        colors_render: torch.Tensor,
+        pred_mask: Optional[torch.Tensor],
+        error_map: Optional[torch.Tensor],
+        semantic_features: Optional[torch.Tensor],
+        semantic_preview_path: Optional[str],
+        semantic_kind: Optional[str],
+        loss: float,
+        spot_loss: Optional[float],
+    ) -> None:
+        """Store the latest training batch for the Spotless inspection panel."""
+
+        def _to_numpy(t: Optional[torch.Tensor]) -> Optional[np.ndarray]:
+            if t is None:
+                return None
+            return t.detach().float().cpu().numpy()
+
+        with self._lock:
+            self._spotless_snapshot = {
+                "step": step,
+                "loss": loss,
+                "spot_loss": spot_loss,
+                "gt": _to_numpy(pixels[0].clamp(0.0, 1.0)),
+                "render": _to_numpy(colors_render[0].clamp(0.0, 1.0)),
+                "mask": _to_numpy(pred_mask[0].clamp(0.0, 1.0)) if pred_mask is not None else None,
+                "error_map": _to_numpy(error_map[0]) if error_map is not None else None,
+                "semantics": _to_numpy(semantic_features[0]) if semantic_features is not None else None,
+                "semantic_preview_path": semantic_preview_path,
+                "semantic_kind": semantic_kind,
+            }
+            self._spotless_snapshot_step = step

@@ -14,6 +14,7 @@ import glfw
 
 from imgui_bundle import imgui
 from imgui_bundle import implot
+from imgui_bundle import immvision
 from imgui_bundle.python_backends.glfw_backend import GlfwRenderer
 import imgui_bundle.imgui.internal as internal
 
@@ -36,7 +37,7 @@ def _patched_getContext(context=None):
         return _dummy_ctx
 _ctxdata.getContext = _patched_getContext
 
-from viewer.camera import OrbitCamera, FPSCamera, CameraState, create_camera
+from viewer.camera import OrbitCamera, FPSCamera, DatasetCamera, CameraState, create_camera
 from viewer.scene import SceneState
 from viewer.ui import UI, RenderSettings
 from viewer.renderer import Renderer
@@ -75,6 +76,7 @@ class App:
         # ImGui setup with docking
         imgui.create_context()
         implot.create_context()
+        immvision.use_rgb_color_order()
         apply_gruvbox_theme()
         io = imgui.get_io()
         io.config_flags |= imgui.ConfigFlags_.docking_enable
@@ -86,7 +88,14 @@ class App:
         self.render_settings = RenderSettings()
         self.renderer = Renderer(width, height, device=self.scene_state._device, render_settings=self.render_settings)
         self.trainer = Trainer(self.scene_state, TrainerConfig())
-        self.ui = UI(self.scene_state, self.renderer, self.render_settings, self.camera, self.trainer)
+        self.ui = UI(
+            self.scene_state,
+            self.renderer,
+            self.render_settings,
+            self.camera,
+            self.trainer,
+            on_go_to_frustum=self.jump_to_dataset_camera,
+        )
         self.input_handler = InputHandler(self.window, self.camera, self.render_settings)
 
         # Load initial data if provided
@@ -100,11 +109,6 @@ class App:
         self.camera.fit_to_bounds(bmin, bmax)
         radius = getattr(self.camera, 'radius', 5.0)
         logger.info(f"Camera fitted to scene bounds: min={bmin}, max={bmax}, radius={radius:.2f}")
-
-        # Build debug VBO caches for any pre-loaded data
-        self.renderer.update_debug_cache(self.scene_state, True, True)
-        self.renderer._cached_scene_version = self.scene_state.get_scene_version()
-        self.renderer._cached_frustum_version = self.render_settings.get_frustum_version()
 
         # Callbacks
         glfw.set_framebuffer_size_callback(self.window, self._on_resize)
@@ -146,6 +150,7 @@ class App:
         internal.dock_builder_dock_window("Scene", dock_id_right)
         internal.dock_builder_dock_window("Render Settings", dock_id_right)
         internal.dock_builder_dock_window("Trainer", dock_id_right)
+        internal.dock_builder_dock_window("Spotless", dock_id_right)
         internal.dock_builder_finish(dockspace_id)
 
         self._dockspace_setup_done = True
@@ -171,6 +176,26 @@ class App:
         self.input_handler.camera = self.camera
         self._current_camera_mode = new_mode
         logger.info(f"Switched camera mode to {new_mode}")
+
+    def jump_to_dataset_camera(self, index: int):
+        """Jump the viewport camera to the Nth dataset camera."""
+        pose = self.scene_state.get_camera_pose_by_index(index)
+        if pose is None:
+            logger.warning("No dataset camera available for frustum jump")
+            return
+
+        self.camera = DatasetCamera(
+            self.camera.width,
+            self.camera.height,
+            pose["c2w"],
+            pose["K"],
+        )
+        self.render_settings.camera_mode = "fps"
+        self._current_camera_mode = "fps"
+        self.ui.camera = self.camera
+        self.input_handler.camera = self.camera
+        self.input_handler.release_fps_cursor()
+        logger.info(f"Jumped viewport camera to dataset frustum #{index + 1}")
 
     def run(self):
         while not glfw.window_should_close(self.window):
@@ -208,6 +233,11 @@ class App:
             # Trainer panel (auto-docked to right split as a tab)
             imgui.begin("Trainer")
             self.ui.draw_trainer()
+            imgui.end()
+
+            # Spotless panel (auto-docked to right split as a tab)
+            imgui.begin("Spotless")
+            self.ui.draw_spotless()
             imgui.end()
 
             # Process all input
