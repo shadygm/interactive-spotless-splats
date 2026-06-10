@@ -7,6 +7,7 @@ from typing import List, Tuple, Dict, Optional, Any
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -16,11 +17,182 @@ from loguru import logger
 from gsplat.rendering import rasterization
 from gsplat.strategy import MCMCStrategy, DefaultStrategy
 from gsplat import export_splats
+from viewer.scene.loaders import _load_point_cloud_records
 
 
 # ---------------------------------------------------------------------------
 # Simple COLMAP parser using pycolmap 4.x
 # ---------------------------------------------------------------------------
+
+
+def _flip_c2w_to_gsplat(c2w: np.ndarray) -> np.ndarray:
+    """Convert OpenGL-style c2w to the OpenCV/COLMAP convention used by gsplat."""
+    c2w_gsplat = c2w.copy()
+    c2w_gsplat[:3, 1] *= -1.0
+    c2w_gsplat[:3, 2] *= -1.0
+    return c2w_gsplat
+
+
+def _similarity_from_cameras(c2w: np.ndarray, strict_scaling: bool = False, center_method: str = "focus") -> np.ndarray:
+    """Match the reference gsplat normalization transform for camera poses."""
+    t = c2w[:, :3, 3]
+    R = c2w[:, :3, :3]
+
+    # Estimate the world up axis from average camera up axes.
+    ups = np.sum(R * np.array([0.0, -1.0, 0.0]), axis=-1)
+    world_up = np.mean(ups, axis=0)
+    world_up /= np.linalg.norm(world_up)
+
+    up_camspace = np.array([0.0, -1.0, 0.0])
+    c = float((up_camspace * world_up).sum())
+    cross = np.cross(world_up, up_camspace)
+    skew = np.array(
+        [
+            [0.0, -cross[2], cross[1]],
+            [cross[2], 0.0, -cross[0]],
+            [-cross[1], cross[0], 0.0],
+        ]
+    )
+    if c > -1.0:
+        R_align = np.eye(3) + skew + (skew @ skew) * 1.0 / (1.0 + c)
+    else:
+        R_align = np.array(
+            [
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+
+    R = R_align @ R
+    fwds = np.sum(R * np.array([0.0, 0.0, 1.0]), axis=-1)
+    t = (R_align @ t[..., None])[..., 0]
+
+    if center_method == "focus":
+        nearest = t + (fwds * -t).sum(-1)[:, None] * fwds
+        translate = -np.median(nearest, axis=0)
+    elif center_method == "poses":
+        translate = -np.median(t, axis=0)
+    else:
+        raise ValueError(f"Unknown center_method {center_method}")
+
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, 3] = translate
+    transform[:3, :3] = R_align
+
+    scale_fn = np.max if strict_scaling else np.median
+    scale = 1.0 / scale_fn(np.linalg.norm(t + translate, axis=-1))
+    transform[:3, :] *= scale
+    return transform
+
+
+def _align_principal_axes(point_cloud: np.ndarray) -> np.ndarray:
+    """Return a PCA alignment transform matching the reference implementation."""
+    centroid = np.median(point_cloud, axis=0)
+    translated = point_cloud - centroid
+    covariance_matrix = np.cov(translated, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance_matrix)
+    sort_indices = eigenvalues.argsort()[::-1]
+    eigenvectors = eigenvectors[:, sort_indices]
+    if np.linalg.det(eigenvectors) < 0:
+        eigenvectors[:, 0] *= -1
+
+    rotation_matrix = eigenvectors.T
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation_matrix
+    transform[:3, 3] = -rotation_matrix @ centroid
+    return transform
+
+
+def _transform_points(matrix: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Apply an SE(3)/similarity transform to points."""
+    return points @ matrix[:3, :3].T + matrix[:3, 3]
+
+
+def _transform_cameras(matrix: np.ndarray, camtoworlds: np.ndarray) -> np.ndarray:
+    """Apply an SE(3)/similarity transform to camera-to-world matrices."""
+    camtoworlds = np.einsum("nij,ki->nkj", camtoworlds, matrix)
+    scaling = np.linalg.norm(camtoworlds[:, 0, :3], axis=1)
+    camtoworlds[:, :3, :3] = camtoworlds[:, :3, :3] / scaling[:, None, None]
+    return camtoworlds
+
+
+def _normalize_world_space(camtoworlds: np.ndarray, points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Normalize cameras and points using the reference gsplat procedure."""
+    t1 = _similarity_from_cameras(camtoworlds)
+    camtoworlds = _transform_cameras(t1, camtoworlds)
+    points = _transform_points(t1, points)
+
+    t2 = _align_principal_axes(points)
+    camtoworlds = _transform_cameras(t2, camtoworlds)
+    points = _transform_points(t2, points)
+
+    transform = t2 @ t1
+
+    # Reference upside-down fix.
+    if np.median(points[:, 2]) > np.mean(points[:, 2]):
+        t3 = np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        camtoworlds = _transform_cameras(t3, camtoworlds)
+        points = _transform_points(t3, points)
+        transform = t3 @ transform
+
+    return camtoworlds, points, transform
+
+
+def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product for quaternions in [w, x, y, z] format."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=np.float32,
+    )
+
+
+def _quat_from_matrix(R: np.ndarray) -> np.ndarray:
+    """Convert a 3x3 rotation matrix to a quaternion [w, x, y, z]."""
+    m00, m01, m02 = R[0]
+    m10, m11, m12 = R[1]
+    m20, m21, m22 = R[2]
+    trace = m00 + m11 + m22
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m21 - m12) * s
+        y = (m02 - m20) * s
+        z = (m10 - m01) * s
+    elif m00 > m11 and m00 > m22:
+        s = 2.0 * np.sqrt(1.0 + m00 - m11 - m22)
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = 2.0 * np.sqrt(1.0 + m11 - m00 - m22)
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + m22 - m00 - m11)
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    return np.array([w, x, y, z], dtype=np.float32)
 
 class _SimpleColmapParser:
     """Minimal COLMAP parser using pycolmap 4.x API."""
@@ -55,6 +227,9 @@ class _SimpleColmapParser:
             if model == "PINHOLE":
                 fx, fy, cx, cy = params
             elif model == "SIMPLE_PINHOLE":
+                fx = fy = params[0]
+                cx, cy = params[1], params[2]
+            elif model == "SIMPLE_RADIAL":
                 fx = fy = params[0]
                 cx, cy = params[1], params[2]
             else:
@@ -162,6 +337,187 @@ class _SimpleColmapDataset(torch.utils.data.Dataset):
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy().astype(np.float32)
         camtoworld = self.parser.camtoworlds[index].copy()
+
+        data = {
+            "K": torch.from_numpy(K),
+            "camtoworld": torch.from_numpy(camtoworld),
+            "image": torch.from_numpy(image),
+            "image_id": item,
+            "camera_idx": self.parser.camera_indices[index],
+        }
+        return data
+
+
+# ---------------------------------------------------------------------------
+# Transforms.json (nerfstudio / instant-ngp) parser
+# ---------------------------------------------------------------------------
+
+class _TransformsJsonParser:
+    """Parse transforms.json dataset for training."""
+
+    def __init__(self, data_dir: str, factor: int = 1, test_every: int = 8):
+        import json
+
+        self.data_dir = data_dir
+        self.factor = factor
+        self.test_every = test_every
+
+        transforms_path = os.path.join(data_dir, "transforms.json")
+        with open(transforms_path, "r") as f:
+            meta = json.load(f)
+
+        # Distortion is tracked per frame because on-the-go exports can vary
+        # focal length and radial distortion slightly across frames.
+        self.dist_params: Dict[int, np.ndarray] = {}
+        self.undist_mapx: Dict[int, np.ndarray] = {}
+        self.undist_mapy: Dict[int, np.ndarray] = {}
+        self.undist_roi: Dict[int, Tuple[int, int, int, int]] = {}
+        self.Ks_dict = {}
+        self.imsize_dict = {}
+        self.camera_ids = []
+        self.camera_indices = []
+        self.camera_id_to_idx = {}
+        self.transform = np.eye(4, dtype=np.float64)
+        self.transform_inv = np.eye(4, dtype=np.float64)
+
+        # Collect image data
+        image_names = []
+        image_paths = []
+        camtoworlds = []
+        points_records = _load_point_cloud_records(data_dir)
+
+        frames = meta.get("frames", [])
+        for camera_id, frame in enumerate(frames):
+            file_path = frame.get("file_path", "")
+            if not os.path.isabs(file_path):
+                file_path = os.path.normpath(os.path.join(data_dir, file_path))
+            name = os.path.basename(file_path)
+
+            w = int(frame.get("w", meta.get("w", 1920)))
+            h = int(frame.get("h", meta.get("h", 1080)))
+            fl_x = float(frame.get("fl_x", meta.get("fl_x", 0.0)))
+            fl_y = float(frame.get("fl_y", meta.get("fl_y", fl_x)))
+            cx = float(frame.get("cx", meta.get("cx", w / 2.0)))
+            cy = float(frame.get("cy", meta.get("cy", h / 2.0)))
+            k1 = float(frame.get("k1", meta.get("k1", 0.0)))
+            is_fisheye = bool(frame.get("is_fisheye", meta.get("is_fisheye", False)))
+
+            if factor > 1:
+                w //= factor
+                h //= factor
+                fl_x /= factor
+                fl_y /= factor
+                cx /= factor
+                cy /= factor
+
+            K = np.array([[fl_x, 0.0, cx], [0.0, fl_y, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+            if abs(k1) > 1e-8 and not is_fisheye:
+                dist_params = np.array([k1, 0.0, 0.0, 0.0], dtype=np.float64)
+                K_undist, roi = cv2.getOptimalNewCameraMatrix(K, dist_params, (w, h), 0)
+                mapx, mapy = cv2.initUndistortRectifyMap(
+                    K, dist_params, None, K_undist, (w, h), cv2.CV_32FC1
+                )
+                self.dist_params[camera_id] = dist_params
+                self.undist_mapx[camera_id] = mapx
+                self.undist_mapy[camera_id] = mapy
+                self.undist_roi[camera_id] = roi
+                K = K_undist
+                w, h = int(roi[2]), int(roi[3])
+                logger.info(
+                    f"Frame {camera_id} SIMPLE_RADIAL undistortion: k1={k1:.6f}, roi={roi}"
+                )
+
+            self.Ks_dict[camera_id] = K
+            self.imsize_dict[camera_id] = (w, h)
+
+            transform_matrix = np.array(frame["transform_matrix"], dtype=np.float32)
+            # transforms.json uses OpenGL-style c2w. Convert to the OpenCV/COLMAP
+            # convention that gsplat expects by flipping camera Y/Z axes.
+            camtoworld = _flip_c2w_to_gsplat(transform_matrix)
+
+            camtoworlds.append(camtoworld)
+            self.camera_ids.append(camera_id)
+            image_names.append(name)
+            image_paths.append(file_path)
+
+        camtoworlds = np.stack(camtoworlds, axis=0)
+        points = np.zeros((0, 3), dtype=np.float32)
+        points_rgb = np.zeros((0, 3), dtype=np.uint8)
+        if points_records:
+            points = np.stack([p["xyz"] for p in points_records.values()], axis=0).astype(np.float32)
+            points_rgb = np.stack([p["rgb"] for p in points_records.values()], axis=0).astype(np.uint8)
+
+        if len(camtoworlds) > 0 and len(points) > 0:
+            camtoworlds, points, transform = _normalize_world_space(camtoworlds, points)
+            self.transform = transform
+            self.transform_inv = np.linalg.inv(transform)
+
+        # Sort by image name for consistent train/val splits
+        inds = np.argsort(image_names)
+        self.image_names = [image_names[i] for i in inds]
+        self.image_paths = [image_paths[i] for i in inds]
+        self.camtoworlds = camtoworlds[inds].astype(np.float32)
+        self.camera_ids = [self.camera_ids[i] for i in inds]
+
+        # Create 0-based contiguous camera indices
+        unique_camera_ids = sorted(set(self.camera_ids))
+        self.camera_id_to_idx = {cid: idx for idx, cid in enumerate(unique_camera_ids)}
+        self.camera_indices = [self.camera_id_to_idx[cid] for cid in self.camera_ids]
+        self.num_cameras = len(unique_camera_ids)
+
+        # Point cloud: prefer the on-the-go dataset-root PointCloud.ply and fall
+        # back to COLMAP sparse points if present.
+        self.points = np.zeros((0, 3), dtype=np.float32)
+        self.points_rgb = np.zeros((0, 3), dtype=np.uint8)
+        if len(points) > 0:
+            self.points = points.astype(np.float32)
+            self.points_rgb = points_rgb.astype(np.uint8)
+
+        # Scene scale
+        if len(self.camtoworlds) > 0:
+            camera_locations = self.camtoworlds[:, :3, 3]
+            scene_center = np.mean(camera_locations, axis=0)
+            dists = np.linalg.norm(camera_locations - scene_center, axis=1)
+            self.scene_scale = float(np.max(dists))
+        else:
+            self.scene_scale = 1.0
+
+
+class _TransformsJsonDataset(torch.utils.data.Dataset):
+    """Dataset for transforms.json format."""
+
+    def __init__(self, parser: _TransformsJsonParser, split: str = "train"):
+        self.parser = parser
+        self.split = split
+        indices = np.arange(len(self.parser.image_names))
+        if split == "train":
+            self.indices = indices[indices % self.parser.test_every != 0]
+        else:
+            self.indices = indices[indices % self.parser.test_every == 0]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, item: int) -> Dict[str, Any]:
+        index = self.indices[item]
+        image_path = self.parser.image_paths[index]
+
+        image = imageio.imread(image_path)[..., :3]
+
+        camera_id = self.parser.camera_ids[index]
+        K = self.parser.Ks_dict[camera_id].copy().astype(np.float32)
+        camtoworld = self.parser.camtoworlds[index].copy()
+
+        # Undistort if distortion maps are present
+        if camera_id in self.parser.undist_mapx:
+            import cv2
+            mapx = self.parser.undist_mapx[camera_id]
+            mapy = self.parser.undist_mapy[camera_id]
+            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+            x, y, w, h = self.parser.undist_roi[camera_id]
+            image = image[y:y + h, x:x + w]
+            K[0, 2] -= x
+            K[1, 2] -= y
 
         data = {
             "K": torch.from_numpy(K),
@@ -313,6 +669,7 @@ class Trainer:
         self._trainloader = None
         self._trainloader_iter = None
         self._scheduler = None
+        self._parser = None
 
     def start(self, colmap_path: str):
         """Start training in a background thread."""
@@ -358,13 +715,26 @@ class Trainer:
                 # Allow cuDNN to benchmark optimal algorithms for consistent input sizes
                 torch.backends.cudnn.benchmark = True
 
-            # Parse COLMAP data
-            parser = _SimpleColmapParser(
-                data_dir=colmap_path,
-                factor=cfg.data_factor,
-                test_every=cfg.test_every,
-            )
-            trainset = _SimpleColmapDataset(parser, split="train")
+            # Auto-detect dataset format
+            import os
+            transforms_path = os.path.join(colmap_path, "transforms.json")
+            if os.path.exists(transforms_path):
+                logger.info(f"Detected transforms.json dataset at {colmap_path}")
+                parser = _TransformsJsonParser(
+                    data_dir=colmap_path,
+                    factor=cfg.data_factor,
+                    test_every=cfg.test_every,
+                )
+                trainset = _TransformsJsonDataset(parser, split="train")
+            else:
+                logger.info(f"Detected COLMAP dataset at {colmap_path}")
+                parser = _SimpleColmapParser(
+                    data_dir=colmap_path,
+                    factor=cfg.data_factor,
+                    test_every=cfg.test_every,
+                )
+                trainset = _SimpleColmapDataset(parser, split="train")
+            self._parser = parser
 
             scene_scale = parser.scene_scale * 1.1
 
@@ -385,7 +755,6 @@ class Trainer:
                 )
             else:
                 self._strategy = DefaultStrategy(
-                    cap_max=cfg.max_splats,
                     refine_start_iter=500,
                     refine_stop_iter=max(cfg.num_iterations - 5000, 1000),
                     refine_every=100,
@@ -571,11 +940,33 @@ class Trainer:
                 [self._splats["sh0"], self._splats["shN"]], 1
             ).detach().clone()
 
-            # Flip Y axis to match viewer convention (same as PlyLoader)
-            means[:, 1] *= -1
-            # Quaternions: [w, x, y, z] -> [w, -x, y, -z] for Y flip
-            quats[:, 1] *= -1
-            quats[:, 3] *= -1
+            # If the dataset was normalized for training, transform the Gaussians
+            # back into the original scene frame before exposing them to the viewer.
+            if self._parser is not None and hasattr(self._parser, "transform_inv"):
+                inv_transform = self._parser.transform_inv.astype(np.float32)
+                means_np = means.cpu().numpy()
+                scales_np = scales.cpu().numpy()
+                quats_np = quats.cpu().numpy()
+                means_np = _transform_points(inv_transform, means_np)
+                scale_factor = float(np.linalg.norm(inv_transform[0, :3]))
+                scales_np = scales_np * scale_factor
+                rot = inv_transform[:3, :3]
+                rot_scale = float(np.linalg.norm(rot[0]))
+                if rot_scale > 0:
+                    rot = rot / rot_scale
+                q_rot = _quat_from_matrix(rot)
+                quats_np = np.stack([_quat_mul(q_rot, q) for q in quats_np], axis=0)
+                means = torch.from_numpy(means_np).to(means.device)
+                scales = torch.from_numpy(scales_np).to(scales.device)
+                quats = torch.from_numpy(quats_np).to(quats.device)
+
+            # COLMAP/Ply scenes are stored in the viewer with a Y flip; the
+            # transforms.json path already lives in the viewer's raw frame.
+            if not isinstance(self._parser, _TransformsJsonParser):
+                means[:, 1] *= -1
+                # Quaternions: [w, x, y, z] -> [w, -x, y, -z] for Y flip
+                quats[:, 1] *= -1
+                quats[:, 3] *= -1
 
             gaussians = {
                 "means": means,

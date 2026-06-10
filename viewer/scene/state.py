@@ -8,7 +8,7 @@ from loguru import logger
 from viewer.scene.bounds import compute_scene_bounds
 from viewer.scene.frustums import build_camera_frustums
 from viewer.scene.point_cloud import extract_point_cloud
-from viewer.scene.loaders import ColmapLoader, PlyLoader
+from viewer.scene.loaders import ColmapLoader, PlyLoader, TransformsJsonLoader
 from viewer.scene.gaussian_data import build_axis_gaussians
 
 
@@ -33,10 +33,11 @@ class SceneState:
         with self._lock:
             return self._version
 
-    def load_colmap(self, path):
-        """Parse a COLMAP dataset directory."""
+    def load_dataset(self, path):
+        """Parse a COLMAP or transforms.json dataset directory."""
         with self._lock:
             try:
+                # Try COLMAP first
                 result = ColmapLoader().load(path)
                 self.colmap_cameras = result["cameras"]
                 self.colmap_images = result["images"]
@@ -50,9 +51,35 @@ class SceneState:
                     self.has_gaussians = False
                     self._default_gaussians = False
                 self._bump_version()
-            except Exception as e:
-                logger.error(f"Failed to load COLMAP from {path}: {e}")
-                self.has_colmap = False
+            except Exception as colmap_err:
+                # Fallback to transforms.json if present
+                import os
+                if os.path.exists(os.path.join(path, "transforms.json")):
+                    try:
+                        result = TransformsJsonLoader().load(path)
+                        self.colmap_cameras = result["cameras"]
+                        self.colmap_images = result["images"]
+                        self.colmap_points3D = result["points3D"]
+                        self.has_colmap = bool(
+                            self.colmap_cameras or self.colmap_images or self.colmap_points3D
+                        )
+                        self._last_colmap_path = path
+                        if self._default_gaussians:
+                            self.gaussians = None
+                            self.has_gaussians = False
+                            self._default_gaussians = False
+                        self._bump_version()
+                        logger.info(f"Loaded transforms.json dataset from {path}")
+                    except Exception as e:
+                        logger.error(f"Failed to load transforms.json from {path}: {e}")
+                        self.has_colmap = False
+                else:
+                    logger.error(f"Failed to load COLMAP from {path}: {colmap_err}")
+                    self.has_colmap = False
+
+    def load_colmap(self, path):
+        """Backward-compatible alias for load_dataset."""
+        self.load_dataset(path)
 
     def load_ply(self, path):
         """Parse a 3DGS PLY file and merge with axis Gaussians."""
@@ -102,6 +129,15 @@ class SceneState:
                 "sh_degree": self.gaussians["sh_degree"],
             }
 
+    def has_learned_gaussians(self):
+        """Return True when a non-default splat set is present.
+
+        This is used to suppress the initial point-cloud overlay once the scene
+        has a real splat model, either loaded from disk or produced by training.
+        """
+        with self._lock:
+            return self.gaussians is not None and not self._default_gaussians
+
     def get_scene_bounds(self):
         """Return axis-aligned bounding box (min, max) of camera positions and points."""
         with self._lock:
@@ -121,6 +157,8 @@ class SceneState:
     def get_point_cloud(self):
         """Return (xyz, rgb) numpy arrays from colmap_points3D."""
         with self._lock:
+            if self.has_learned_gaussians():
+                return None, None
             if not self.has_colmap or not self.colmap_points3D:
                 return None, None
             return extract_point_cloud(self.colmap_points3D)

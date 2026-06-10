@@ -29,8 +29,8 @@ class UIManager:
             self.trainer_panel.draw()
 
     @property
-    def pending_colmap_path(self):
-        return self.scene_panel.pending_colmap_path
+    def pending_dataset_path(self):
+        return self.scene_panel.pending_dataset_path
 
     @property
     def pending_ply_path(self):
@@ -73,8 +73,8 @@ class UI:
         return self._manager.draw_trainer_panel()
 
     @property
-    def pending_colmap_path(self):
-        return self._manager.pending_colmap_path
+    def pending_dataset_path(self):
+        return self._manager.pending_dataset_path
 
     @property
     def pending_ply_path(self):

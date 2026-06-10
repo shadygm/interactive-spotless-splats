@@ -46,7 +46,7 @@ from viewer.trainer import Trainer, TrainerConfig
 
 
 class App:
-    def __init__(self, width=1280, height=720, colmap_path=None, ply_path=None):
+    def __init__(self, width=1280, height=720, dataset_path=None, ply_path=None):
         self.width = width
         self.height = height
 
@@ -90,8 +90,8 @@ class App:
         self.input_handler = InputHandler(self.window, self.camera, self.render_settings)
 
         # Load initial data if provided
-        if colmap_path:
-            self.scene_state.load_colmap(colmap_path)
+        if dataset_path:
+            self.scene_state.load_dataset(dataset_path)
         if ply_path:
             self.scene_state.load_ply(ply_path)
 
@@ -214,14 +214,14 @@ class App:
             self.input_handler.process(dt)
 
             # Check for pending scene loads from UI
-            pending_colmap = self.ui.pending_colmap_path
+            pending_dataset = self.ui.pending_dataset_path
             pending_ply = self.ui.pending_ply_path
-            if pending_colmap is not None:
-                self.scene_state.load_colmap(pending_colmap)
+            if pending_dataset is not None:
+                self.scene_state.load_dataset(pending_dataset)
                 self.renderer.update_debug_cache(self.scene_state, True, True)
             if pending_ply is not None:
                 self.scene_state.load_ply(pending_ply)
-            if pending_colmap is not None or pending_ply is not None:
+            if pending_dataset is not None or pending_ply is not None:
                 self.ui.clear_pending_actions()
 
             # React to camera mode changes from UI
@@ -240,9 +240,10 @@ class App:
             gsplat_ok = self.renderer.render_gsplat(self.camera, gaussians, self.width, self.height)
             if gsplat_ok:
                 self.renderer.render_texture_to_screen()
+            skip_points = self.trainer.is_running or self.scene_state.has_learned_gaussians()
             self.renderer.render_debug(
                 self.camera, self.scene_state, self.width, self.height,
-                skip_points=self.trainer.is_running,
+                skip_points=skip_points,
             )
             t4 = time.perf_counter()
 

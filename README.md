@@ -20,14 +20,17 @@ pip install -e .
 # Load a 3DGS PLY file
 uv run python -m viewer --ply path/to/model.ply
 
-# Load a COLMAP dataset
-uv run python -m viewer --colmap path/to/colmap/
+# Load a dataset (auto-detects COLMAP or transforms.json format)
+uv run python -m viewer --dataset path/to/dataset/
 
-# Example: load a 360_v2 bonsai scene
-uv run python -m viewer --colmap ../data/360_v2/bonsai/
+# Example: load a 360_v2 bonsai scene (COLMAP)
+uv run python -m viewer --dataset ../data/360_v2/bonsai/
+
+# Example: load a transforms.json dataset (e.g. nerfstudio / on-the-go)
+uv run python -m viewer --dataset ../data/on-the-go/arcdetriomphe/
 
 # Both + custom resolution
-uv run python -m viewer --ply model.ply --colmap dataset/ --width 1920 --height 1080
+uv run python -m viewer --ply model.ply --dataset dataset/ --width 1920 --height 1080
 
 # Debug logging
 uv run python -m viewer --ply model.ply --log-level DEBUG
@@ -37,11 +40,11 @@ uv run python -m viewer --help
 ```
 
 ```
-usage: __main__.py [-h] [--colmap COLMAP] [--ply PLY] [--width WIDTH] [--height HEIGHT] [--log-level {TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,CRITICAL}] [--log-file LOG_FILE]
+usage: __main__.py [-h] [--dataset DATASET] [--ply PLY] [--width WIDTH] [--height HEIGHT] [--log-level {TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,CRITICAL}] [--log-file LOG_FILE]
 
 options:
   -h, --help            show this help message and exit
-  --colmap COLMAP
+  --dataset DATASET     Path to a dataset directory. Auto-detects COLMAP or transforms.json format.
   --ply PLY
   --width WIDTH
   --height HEIGHT

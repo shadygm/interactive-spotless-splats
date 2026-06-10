@@ -16,25 +16,25 @@ class ScenePanel(Panel):
         self.scene_state = scene_state
         self.renderer = renderer
         self.render_settings = render_settings
-        self._colmap_path_input = ""
+        self._dataset_path_input = ""
         self._ply_path_input = ""
-        self._colmap_dialog = None
+        self._dataset_dialog = None
         self._ply_dialog = None
-        self.pending_colmap_path = None
+        self.pending_dataset_path = None
         self.pending_ply_path = None
 
     def draw(self):
-        if imgui.button("Import COLMAP Dataset"):
-            self._colmap_dialog = pfd.select_folder("Select COLMAP dataset folder")
-            logger.debug("Opened COLMAP folder dialog")
+        if imgui.button("Import Dataset"):
+            self._dataset_dialog = pfd.select_folder("Select dataset folder")
+            logger.debug("Opened dataset folder dialog")
 
-        if self._colmap_dialog is not None:
-            if self._colmap_dialog.ready():
-                result = self._colmap_dialog.result()
-                self._colmap_dialog = None
+        if self._dataset_dialog is not None:
+            if self._dataset_dialog.ready():
+                result = self._dataset_dialog.result()
+                self._dataset_dialog = None
                 if result:
-                    logger.info(f"Selected COLMAP folder: {result}")
-                    self.pending_colmap_path = result
+                    logger.info(f"Selected dataset folder: {result}")
+                    self.pending_dataset_path = result
 
         if imgui.button("Import PLY Splat"):
             self._ply_dialog = pfd.open_file("Select PLY file", filters=["*.ply"])
@@ -65,7 +65,7 @@ class ScenePanel(Panel):
             imgui.text(f"FPS:       {fps:,.1f}")
 
     def clear_pending_actions(self):
-        self.pending_colmap_path = None
+        self.pending_dataset_path = None
         self.pending_ply_path = None
 
 

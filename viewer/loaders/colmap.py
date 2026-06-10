@@ -110,3 +110,120 @@ def read_points3D_binary(path):
             }
     logger.info(f"Loaded {len(points3D)} points3D from {path}")
     return points3D
+
+
+# ---------------------------------------------------------------------------
+# Text format loaders
+# ---------------------------------------------------------------------------
+
+_CAMERA_MODEL_NAME_TO_ID = {
+    "SIMPLE_PINHOLE": 0,
+    "PINHOLE": 1,
+    "SIMPLE_RADIAL": 2,
+    "RADIAL": 3,
+    "OPENCV": 4,
+    "OPENCV_FISHEYE": 5,
+    "FULL_OPENCV": 6,
+    "FOV": 7,
+    "SIMPLE_RADIAL_FISHEYE": 8,
+    "RADIAL_FISHEYE": 9,
+    "THIN_PRISM_FISHEYE": 10,
+}
+
+
+def read_cameras_text(path):
+    """Read COLMAP cameras.txt file."""
+    cameras = {}
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            camera_id = int(parts[0])
+            model_name = parts[1]
+            width = int(parts[2])
+            height = int(parts[3])
+            params = np.array([float(x) for x in parts[4:]], dtype=np.float64)
+            model = _CAMERA_MODEL_NAME_TO_ID.get(model_name, -1)
+            cameras[camera_id] = {
+                "model": model,
+                "width": width,
+                "height": height,
+                "params": params,
+            }
+    logger.info(f"Loaded {len(cameras)} cameras from {path}")
+    return cameras
+
+
+def read_images_text(path):
+    """Read COLMAP images.txt file."""
+    images = {}
+    with open(path, "r") as f:
+        lines = f.readlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        i += 1
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        image_id = int(parts[0])
+        qvec = np.array([float(x) for x in parts[1:5]], dtype=np.float64)
+        tvec = np.array([float(x) for x in parts[5:8]], dtype=np.float64)
+        camera_id = int(parts[8])
+        name = parts[9]
+        # Read the next line (2D points, if present)
+        xys = []
+        point3D_ids = []
+        if i < len(lines):
+            next_line = lines[i].strip()
+            if next_line and not next_line.startswith("#"):
+                i += 1
+                point_parts = next_line.split()
+                # Format: (X, Y, POINT3D_ID) triplets
+                for j in range(0, len(point_parts), 3):
+                    if j + 2 < len(point_parts):
+                        xys.append([float(point_parts[j]), float(point_parts[j + 1])])
+                        point3D_ids.append(int(point_parts[j + 2]))
+        images[image_id] = {
+            "qvec": qvec,
+            "tvec": tvec,
+            "camera_id": camera_id,
+            "name": name,
+            "xys": np.array(xys, dtype=np.float64) if xys else np.zeros((0, 2), dtype=np.float64),
+            "point3D_ids": np.array(point3D_ids, dtype=np.int64) if point3D_ids else np.zeros(0, dtype=np.int64),
+        }
+    logger.info(f"Loaded {len(images)} images from {path}")
+    return images
+
+
+def read_points3D_text(path):
+    """Read COLMAP points3D.txt file."""
+    points3D = {}
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            point3D_id = int(parts[0])
+            xyz = np.array([float(x) for x in parts[1:4]], dtype=np.float64)
+            rgb = np.array([int(x) for x in parts[4:7]], dtype=np.uint8)
+            error = float(parts[7])
+            track_len = int(parts[8])
+            # Parse remaining elements as (IMAGE_ID, POINT2D_IDX) pairs
+            track_parts = parts[9:]
+            track = []
+            for j in range(0, len(track_parts), 2):
+                if j + 1 < len(track_parts):
+                    track.append([int(track_parts[j]), int(track_parts[j + 1])])
+            track = np.array(track, dtype=np.int64).reshape(-1, 2) if track else np.zeros((0, 2), dtype=np.int64)
+            points3D[point3D_id] = {
+                "xyz": xyz,
+                "rgb": rgb,
+                "error": error,
+                "track": track,
+            }
+    logger.info(f"Loaded {len(points3D)} points3D from {path}")
+    return points3D

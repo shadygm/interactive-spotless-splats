@@ -53,6 +53,9 @@ def build_camera_frustums(images, cameras, render_settings=None, scene_scale=Non
             fy = fx
         elif model == 1:  # PINHOLE
             fx, fy, cx, cy = params[0], params[1], params[2], params[3]
+        elif model == 2:  # SIMPLE_RADIAL
+            fx, cx, cy = params[0], params[1], params[2]
+            fy = fx
         else:
             # Default to simple pinhole with first param
             fx = params[0] if len(params) > 0 else width
@@ -79,6 +82,9 @@ def build_camera_frustums(images, cameras, render_settings=None, scene_scale=Non
         corners_cam = K_inv @ corners_px
         # Scale to a fixed visualization depth relative to scene size
         corners_cam = corners_cam * frustum_depth
+        # Flip Z if camera looks down negative Z (OpenGL convention)
+        forward_sign = cam.get("forward_sign", 1.0)
+        corners_cam[2, :] *= forward_sign
         corners_cam = np.vstack([corners_cam, np.ones((1, 4))])
 
         # Transform to world space

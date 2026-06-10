@@ -24,7 +24,8 @@ def _configure_logging(level: str, log_file: str | None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--colmap", type=str, default=None)
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Path to a dataset directory. Auto-detects COLMAP or transforms.json format.")
     parser.add_argument("--ply", type=str, default=None)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
@@ -34,7 +35,7 @@ def main():
     parser.add_argument("--log-file", type=str, default=None,
                         help="Optional file path to also write logs to")
     parser.add_argument("--headless", action="store_true",
-                        help="Run training in headless mode (requires --colmap). No GUI is shown.")
+                        help="Run training in headless mode (requires --dataset). No GUI is shown.")
     parser.add_argument("--output", type=str, default="./output",
                         help="Output directory for saved PLY files in headless mode. Default: ./output")
     args = parser.parse_args()
@@ -42,16 +43,16 @@ def main():
     _configure_logging(args.log_level, args.log_file)
 
     if args.headless:
-        if not args.colmap:
-            parser.error("--headless requires --colmap")
-        _run_headless(args.colmap, args.output)
+        if not args.dataset:
+            parser.error("--headless requires --dataset")
+        _run_headless(args.dataset, args.output)
     else:
         from viewer.app import App
-        app = App(width=args.width, height=args.height, colmap_path=args.colmap, ply_path=args.ply)
+        app = App(width=args.width, height=args.height, dataset_path=args.dataset, ply_path=args.ply)
         app.run()
 
 
-def _run_headless(colmap_path: str, output_dir: str = "./output"):
+def _run_headless(data_path: str, output_dir: str = "./output"):
     """Run training directly without any GUI."""
     from viewer.scene import SceneState
     from viewer.trainer import Trainer, TrainerConfig
@@ -59,8 +60,8 @@ def _run_headless(colmap_path: str, output_dir: str = "./output"):
     scene_state = SceneState()
     cfg = TrainerConfig(headless=True, output_dir=output_dir)
     trainer = Trainer(scene_state, cfg)
-    logger.info(f"Starting headless training on {colmap_path}")
-    trainer.start(colmap_path)
+    logger.info(f"Starting headless training on {data_path}")
+    trainer.start(data_path)
 
     try:
         if trainer._thread is not None:

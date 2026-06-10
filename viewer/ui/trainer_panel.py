@@ -75,17 +75,16 @@ class TrainerPanel(Panel):
         else:
             imgui.begin_disabled(not has_colmap)
             if imgui.button("Start Training", imgui.ImVec2(imgui.get_content_region_avail().x, 0)):
-                # Find the COLMAP path from scene_state
-                # We need to store it when loading; for now, use a heuristic
-                colmap_path = getattr(self.scene_state, "_last_colmap_path", None)
-                if colmap_path:
-                    self.trainer.start(colmap_path)
-                    logger.info(f"Started training from {colmap_path}")
+                # Find the dataset path from scene_state
+                dataset_path = getattr(self.scene_state, "_last_colmap_path", None)
+                if dataset_path:
+                    self.trainer.start(dataset_path)
+                    logger.info(f"Started training from {dataset_path}")
                 else:
-                    logger.warning("No COLMAP path available for training")
+                    logger.warning("No dataset path available for training")
             imgui.end_disabled()
             if not has_colmap:
-                imgui.text_disabled("Load a COLMAP dataset to enable training")
+                imgui.text_disabled("Load a dataset to enable training")
 
         imgui.separator()
 
