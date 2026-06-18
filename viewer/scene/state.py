@@ -1,14 +1,16 @@
 import os
 import threading
+from pathlib import Path
 
 import numpy as np
 import torch
 from loguru import logger
+from gsplat import export_splats
 
 from viewer.camera.state import CameraState
 from viewer.scene.bounds import compute_scene_bounds
 from viewer.scene.frustums import build_camera_frustums
-from viewer.scene.coordinate_system import qvec2rotmat
+from viewer.scene.coordinate_system import flip_quaternion_y, flip_y_axis, qvec2rotmat
 from viewer.scene.point_cloud import extract_point_cloud
 from viewer.scene.loaders import ColmapLoader, PlyLoader, TransformsJsonLoader
 from viewer.scene.gaussian_data import build_axis_gaussians
@@ -23,6 +25,7 @@ class SceneState:
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self.gaussians = build_axis_gaussians(self._device)
         self._default_gaussians = True
+        self.gaussian_y_flipped = False
         self.has_colmap = False
         self.has_gaussians = True
         self._version = 0
@@ -91,6 +94,7 @@ class SceneState:
                 ply_gaussians = result["gaussians"]
                 if ply_gaussians is not None:
                     self.gaussians = ply_gaussians
+                    self.gaussian_y_flipped = True
                     self.has_gaussians = True
                     self._default_gaussians = False
                     self._bump_version()
@@ -139,6 +143,7 @@ class SceneState:
         """
         with self._lock:
             self.gaussians = None
+            self.gaussian_y_flipped = False
             self.has_gaussians = False
             self._default_gaussians = False
             self._bump_version()
@@ -151,6 +156,63 @@ class SceneState:
         """
         with self._lock:
             return self.gaussians is not None and not self._default_gaussians
+
+    def has_exportable_gaussians(self) -> bool:
+        """Return True when the scene holds a non-placeholder splat set."""
+        with self._lock:
+            return self.gaussians is not None and not self._default_gaussians
+
+    def export_ply(self, path: str) -> str:
+        """Export the currently loaded gaussians to a PLY file."""
+        with self._lock:
+            if self.gaussians is None or self._default_gaussians:
+                raise ValueError("No exportable splats are loaded in the scene")
+
+            ply_path = Path(path)
+            if ply_path.suffix.lower() != ".ply":
+                ply_path = ply_path.with_suffix(".ply")
+
+            means = self.gaussians["means"].detach().clone()
+            quats = self.gaussians["quats"].detach().clone()
+            scales = self.gaussians["scales"].detach().clone()
+            opacities = self.gaussians["opacities"].detach().clone()
+            colors = self.gaussians["colors"].detach().clone()
+            sh_degree = int(self.gaussians.get("sh_degree", 0))
+            y_flipped = bool(getattr(self, "gaussian_y_flipped", False))
+
+        if y_flipped:
+            # Internal scene state uses the viewer's Y-flipped frame for PLY- and
+            # COLMAP-loaded splats. Undo that here so the on-disk PLY matches the
+            # standard export convention expected by the loader and other tools.
+            means_np = means.cpu().numpy()
+            quats_np = quats.cpu().numpy()
+            flip_y_axis(means_np)
+            flip_quaternion_y(quats_np)
+            means = torch.from_numpy(means_np).to(means.device)
+            quats = torch.from_numpy(quats_np).to(quats.device)
+
+        # The viewer stores exponentiated scales for rendering, but the PLY
+        # convention used by the loaders/exporters in this repo stores the raw
+        # log-scales in `scale_*` and exponentiates them again on load.
+        scales = torch.log(scales.clamp_min(1e-8))
+
+        if colors.ndim == 2:
+            colors = colors[:, None, :]
+        sh0 = colors[:, :1, :]
+        shN = colors[:, 1:, :]
+
+        export_splats(
+            means=means,
+            scales=scales,
+            quats=quats,
+            opacities=opacities,
+            sh0=sh0,
+            shN=shN,
+            format="ply",
+            save_to=str(ply_path),
+        )
+        logger.info(f"Exported PLY to {ply_path}")
+        return str(ply_path)
 
     def get_scene_bounds(self):
         """Return axis-aligned bounding box (min, max) of camera positions and points."""

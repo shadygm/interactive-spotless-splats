@@ -45,6 +45,10 @@ class TrainerPanel(Panel):
             self._num_iterations = max(100, new_iter)
             self.trainer.config.num_iterations = self._num_iterations
 
+        changed_eval, enabled_eval = imgui.checkbox("Evaluations", self.trainer.config.evaluations)
+        if changed_eval:
+            self.trainer.config.evaluations = enabled_eval
+
         # Dataset downsampling factor
         changed_factor, new_factor = imgui.input_int(
             "Data Factor", self._data_factor, step=1, step_fast=2
@@ -107,8 +111,16 @@ class TrainerPanel(Panel):
         if self.trainer.is_running:
             imgui.text(self.trainer.status_message)
             imgui.text(f"Splats: {self.trainer.current_splats:,}")
+            with self.trainer._lock:
+                eval_history = list(self.trainer.eval_history)
+            if eval_history:
+                imgui.text(f"Eval PSNR: {eval_history[-1][1]:.3f}")
         else:
             imgui.text(self.trainer.status_message)
+            with self.trainer._lock:
+                eval_history = list(self.trainer.eval_history)
+            if eval_history:
+                imgui.text(f"Eval PSNR: {eval_history[-1][1]:.3f}")
 
         imgui.separator()
 
@@ -172,3 +184,47 @@ class TrainerPanel(Panel):
             implot.pop_style_var(2)
         else:
             imgui.text_disabled("No loss data yet. Start training to see the plot.")
+
+        imgui.separator()
+        imgui.text("Evaluation PSNR")
+        with self.trainer._lock:
+            eval_history = list(self.trainer.eval_history)
+
+        if eval_history:
+            iters = [x[0] for x in eval_history]
+            psnrs = [x[1] for x in eval_history]
+
+            plot_width = imgui.get_content_region_avail().x
+            plot_height = 220
+
+            implot.push_style_var(implot.StyleVar_.plot_padding, imgui.ImVec2(0, 0))
+            implot.push_style_var(implot.StyleVar_.plot_border_size, 0)
+            if implot.begin_plot("PSNR", size=(plot_width, plot_height)):
+                implot.setup_axes("Iteration", "PSNR")
+                if iters:
+                    implot.setup_axis_limits(
+                        implot.ImAxis_.x1,
+                        float(iters[0]),
+                        float(iters[-1]),
+                        implot.Cond_.always,
+                    )
+                    ymin = min(psnrs)
+                    ymax = max(psnrs)
+                    if abs(ymax - ymin) < 1e-6:
+                        ymin -= 1.0
+                        ymax += 1.0
+                    implot.setup_axis_limits(
+                        implot.ImAxis_.y1,
+                        ymin - 1.0,
+                        ymax + 1.0,
+                        implot.Cond_.always,
+                    )
+                implot.plot_line(
+                    "PSNR",
+                    np.array(iters, dtype=np.float32),
+                    np.array(psnrs, dtype=np.float32),
+                )
+                implot.end_plot()
+            implot.pop_style_var(2)
+        else:
+            imgui.text_disabled("No evaluation data yet. Enable Evaluations and wait for step 1000.")

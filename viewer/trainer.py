@@ -16,7 +16,6 @@ from loguru import logger
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import MCMCStrategy, DefaultStrategy
-from gsplat import export_splats
 from viewer.scene.loaders import _load_point_cloud_records
 from trainer.spotless.dataset import build_semantic_feature_manifest, load_semantic_features
 from trainer.spotless.encoding import get_positional_encodings, get_positional_encodings_from_coords
@@ -203,14 +202,14 @@ def _quat_from_matrix(R: np.ndarray) -> np.ndarray:
 def _discover_semantic_shape(
     image_paths: list[str],
     dataset_root: str | None = None,
-    prefer_clustered: bool = False,
+    feature_kind: str = "raw",
 ) -> tuple[int, ...] | None:
+    requested_kind = feature_kind
     if dataset_root is not None:
         images_dir = os.path.join(dataset_root, "images")
         if os.path.isdir(images_dir):
-            candidates = sorted(Path(images_dir).glob("*_sdfeats*.npy"))
-            if prefer_clustered:
-                candidates = sorted(candidates, key=lambda p: (0 if "clustered" in p.stem else 1, p.name))
+            suffix = "_sdfeats_clustered.npy" if requested_kind == "clustered" else "_sdfeats.npy"
+            candidates = sorted(Path(images_dir).glob(f"*{suffix}"))
             if candidates:
                 logger.info(
                     f"Spotless semantic discovery: probing {candidates[0]} "
@@ -229,20 +228,27 @@ def _discover_semantic_shape(
 
     for image_path in image_paths:
         try:
-            features, candidate, feature_kind = load_semantic_features(
+            features, candidate, loaded_kind = load_semantic_features(
                 image_path,
                 dataset_root=dataset_root,
-                prefer_clustered=prefer_clustered,
+                feature_kind=requested_kind,
             )
             if features is not None:
                 logger.info(
                     f"Spotless semantic discovery: loaded {candidate} "
-                    f"for {image_path} (kind={feature_kind}, shape={tuple(features.shape)})"
+                    f"for {image_path} (kind={loaded_kind}, shape={tuple(features.shape)})"
                 )
                 return tuple(features.shape)
         except Exception as exc:
                 logger.warning(f"Spotless semantic discovery: failed to load features for {image_path}: {exc}")
     return None
+
+
+def _unwrap_singleton_string(value: Any) -> Any:
+    """Normalize DataLoader-collated string fields back to a scalar when uniform."""
+    if isinstance(value, (list, tuple)) and value and all(item == value[0] for item in value):
+        return value[0]
+    return value
 
 
 def _resize_image_if_needed(image: np.ndarray, target_size: Tuple[int, int]) -> np.ndarray:
@@ -366,6 +372,13 @@ class _SimpleColmapParser:
             self.points = np.array(points_list, dtype=np.float32)
             self.points_rgb = np.array(colors_list, dtype=np.uint8)
 
+        if len(self.camtoworlds) > 0 and len(self.points) > 0:
+            self.camtoworlds, self.points, self.transform = _normalize_world_space(self.camtoworlds, self.points)
+            self.transform_inv = np.linalg.inv(self.transform)
+        else:
+            self.transform = np.eye(4, dtype=np.float64)
+            self.transform_inv = np.eye(4, dtype=np.float64)
+
         # Scene scale
         camera_locations = self.camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
@@ -380,19 +393,28 @@ class _SimpleColmapDataset(torch.utils.data.Dataset):
     The DataLoader workers handle prefetching. This matches simple_trainer.py.
     """
 
-    def __init__(self, parser: _SimpleColmapParser, split: str = "train", prefer_clustered: bool = False):
+    def __init__(
+        self,
+        parser: _SimpleColmapParser,
+        split: str = "train",
+        feature_kind: str = "raw",
+        use_eval_split: bool = False,
+    ):
         self.parser = parser
         self.split = split
-        self.prefer_clustered = prefer_clustered
+        self.feature_kind = feature_kind
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
+        if use_eval_split:
+            if split == "train":
+                self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
         else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+            self.indices = indices if split == "train" else indices[:0]
         self.semantic_feature_paths, self.semantic_preview_paths, self.semantic_shape = build_semantic_feature_manifest(
             self.parser.image_paths,
             dataset_root=self.parser.data_dir,
-            prefer_clustered=self.prefer_clustered,
+            feature_kind=self.feature_kind,
         )
         self.has_semantics = self.semantic_shape is not None
 
@@ -418,7 +440,10 @@ class _SimpleColmapDataset(torch.utils.data.Dataset):
             "image": torch.from_numpy(image),
             "image_id": item,
             "camera_idx": self.parser.camera_indices[index],
-            "semantic_preview_path": str(self.semantic_preview_paths[index]) if self.semantic_preview_paths[index] is not None else None,
+            # Keep the collate path tensor/string-only; PyTorch default_collate
+            # rejects None values inside dict samples.
+            "semantic_preview_path": str(self.semantic_preview_paths[index]) if self.semantic_preview_paths[index] is not None else "",
+            "semantic_kind": self.feature_kind,
         }
         if self.has_semantics:
             feature_path = self.semantic_feature_paths[index]
@@ -440,13 +465,13 @@ class _SimpleColmapDataset(torch.utils.data.Dataset):
 class _TransformsJsonParser:
     """Parse transforms.json dataset for training."""
 
-    def __init__(self, data_dir: str, factor: int = 1, test_every: int = 8, prefer_clustered: bool = False):
+    def __init__(self, data_dir: str, factor: int = 1, test_every: int = 8, feature_kind: str = "raw"):
         import json
 
         self.data_dir = os.path.abspath(data_dir)
         self.factor = factor
         self.test_every = test_every
-        self.prefer_clustered = prefer_clustered
+        self.feature_kind = feature_kind
 
         transforms_path = os.path.join(data_dir, "transforms.json")
         with open(transforms_path, "r") as f:
@@ -551,7 +576,7 @@ class _TransformsJsonParser:
         self.semantic_feature_paths, self.semantic_preview_paths, self.semantic_shape = build_semantic_feature_manifest(
             self.image_paths,
             dataset_root=self.data_dir,
-            prefer_clustered=self.prefer_clustered,
+            feature_kind=self.feature_kind,
         )
         self.has_semantics = self.semantic_shape is not None
 
@@ -582,14 +607,17 @@ class _TransformsJsonParser:
 class _TransformsJsonDataset(torch.utils.data.Dataset):
     """Dataset for transforms.json format."""
 
-    def __init__(self, parser: _TransformsJsonParser, split: str = "train"):
+    def __init__(self, parser: _TransformsJsonParser, split: str = "train", use_eval_split: bool = False):
         self.parser = parser
         self.split = split
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
-            self.indices = indices[indices % self.parser.test_every != 0]
+        if use_eval_split:
+            if split == "train":
+                self.indices = indices[indices % self.parser.test_every != 0]
+            else:
+                self.indices = indices[indices % self.parser.test_every == 0]
         else:
-            self.indices = indices[indices % self.parser.test_every == 0]
+            self.indices = indices if split == "train" else indices[:0]
 
     def __len__(self):
         return len(self.indices)
@@ -622,7 +650,8 @@ class _TransformsJsonDataset(torch.utils.data.Dataset):
             "image": torch.from_numpy(image),
             "image_id": item,
             "camera_idx": self.parser.camera_indices[index],
-            "semantic_preview_path": str(self.parser.semantic_preview_paths[index]) if self.parser.semantic_preview_paths[index] is not None else None,
+            "semantic_preview_path": str(self.parser.semantic_preview_paths[index]) if self.parser.semantic_preview_paths[index] is not None else "",
+            "semantic_kind": self.parser.feature_kind,
         }
         if self.parser.has_semantics:
             feature_path = self.parser.semantic_feature_paths[index]
@@ -709,6 +738,7 @@ def _create_splats_and_optimizers(
     sh_degree: int = 3,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
+    scene_scale: float = 1.0,
 ):
     """Create splats and optimizers from COLMAP parser point cloud."""
     points = torch.from_numpy(parser.points).float()
@@ -740,7 +770,7 @@ def _create_splats_and_optimizers(
     colors[:, 0, :] = _rgb_to_sh(rgbs)
 
     params = [
-        ("means", torch.nn.Parameter(points), 1.6e-4),
+        ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
         ("scales", torch.nn.Parameter(scales), 5e-3),
         ("quats", torch.nn.Parameter(quats), 1e-3),
         ("opacities", torch.nn.Parameter(opacities), 5e-2),
@@ -771,8 +801,9 @@ def _create_splats_and_optimizers(
 class TrainerConfig:
     max_splats: int = 1_000_000
     num_iterations: int = 30_000
-    ssim_lambda: float = 0.2
-    loss_type: str = "l1"
+    ssim_lambda: float = 0.0
+    loss_type: str = "robust"
+    evaluations: bool = False
     semantics: bool = False
     cluster: bool = False
     robust_percentile: float = 0.7
@@ -783,10 +814,27 @@ class TrainerConfig:
     bin_size: int = 10000
     sh_degree: int = 3
     batch_size: int = 1
-    data_factor: int = 1
+    data_factor: int = 4
     test_every: int = 8
     device: str = "cuda"
-    strategy: str = "mcmc"  # "mcmc" or "default"
+    strategy: str = "default"  # "mcmc" or "default"
+    prune_opa: float = 0.005
+    grow_grad2d: float = 0.0002
+    grow_scale3d: float = 0.01
+    grow_scale2d: float = 0.05
+    prune_scale3d: float = 0.1
+    prune_scale2d: float = 0.15
+    refine_scale2d_stop_iter: int = 0
+    refine_start_iter: int = 500
+    refine_stop_iter: int = 15_000
+    reset_every: int = 3000
+    refine_every: int = 200
+    pause_refine_after_reset: int = 0
+    absgrad: bool = False
+    revised_opacity: bool = False
+    strategy_verbose: bool = False
+    opacity_reg: float = 0.0
+    scale_reg: float = 0.0
     headless: bool = False
     output_dir: str = "./output"
 
@@ -804,6 +852,7 @@ class Trainer:
 
         # Loss history: list of (iteration, loss_value)
         self.loss_history: List[Tuple[int, float]] = []
+        self.eval_history: List[Tuple[int, float]] = []
         self.current_iteration = 0
         self.current_splats = 0
         self.is_running = False
@@ -817,6 +866,7 @@ class Trainer:
         self._strategy_state = None
         self._trainloader = None
         self._trainloader_iter = None
+        self._evalloader = None
         self._scheduler = None
         self._parser = None
         self._spotless_module = None
@@ -845,6 +895,7 @@ class Trainer:
         _reset_compiled_ssim()
         self._stop_event.clear()
         self.loss_history.clear()
+        self.eval_history.clear()
         self.current_iteration = 0
         self.status_message = "Initializing..."
         self._spotless_snapshot = None
@@ -894,6 +945,7 @@ class Trainer:
             self._strategy_state = None
             self._trainloader = None
             self._trainloader_iter = None
+            self._evalloader = None
             self._scheduler = None
             self._parser = None
             self._spotless_module = None
@@ -901,6 +953,7 @@ class Trainer:
             self._spotless_snapshot = None
             self._spotless_snapshot_step = -1
             self.loss_history.clear()
+            self.eval_history.clear()
             self.current_iteration = 0
             self.current_splats = 0
             self.status_message = "Reset"
@@ -949,6 +1002,7 @@ class Trainer:
             self.is_running = True
             cfg = self.config
             device = cfg.device
+            evaluations_enabled = bool(cfg.evaluations)
 
             logger.info(f"[TRAINER] CUDA available: {torch.cuda.is_available()}")
             logger.info(f"[TRAINER] Using device: {device}")
@@ -964,15 +1018,25 @@ class Trainer:
             # Auto-detect dataset format
             import os
             transforms_path = os.path.join(colmap_path, "transforms.json")
+            feature_kind = "clustered" if cfg.cluster else "raw"
             if os.path.exists(transforms_path):
                 logger.info(f"Detected transforms.json dataset at {colmap_path}")
                 parser = _TransformsJsonParser(
                     data_dir=colmap_path,
                     factor=cfg.data_factor,
                     test_every=cfg.test_every,
-                    prefer_clustered=cfg.cluster,
+                    feature_kind=feature_kind,
                 )
-                trainset = _TransformsJsonDataset(parser, split="train")
+                trainset = _TransformsJsonDataset(
+                    parser,
+                    split="train",
+                    use_eval_split=evaluations_enabled,
+                )
+                evalset = _TransformsJsonDataset(
+                    parser,
+                    split="eval",
+                    use_eval_split=evaluations_enabled,
+                )
             else:
                 logger.info(f"Detected COLMAP dataset at {colmap_path}")
                 parser = _SimpleColmapParser(
@@ -980,7 +1044,18 @@ class Trainer:
                     factor=cfg.data_factor,
                     test_every=cfg.test_every,
                 )
-                trainset = _SimpleColmapDataset(parser, split="train", prefer_clustered=cfg.cluster)
+                trainset = _SimpleColmapDataset(
+                    parser,
+                    split="train",
+                    feature_kind=feature_kind,
+                    use_eval_split=evaluations_enabled,
+                )
+                evalset = _SimpleColmapDataset(
+                    parser,
+                    split="eval",
+                    feature_kind=feature_kind,
+                    use_eval_split=evaluations_enabled,
+                )
             self._parser = parser
             images_dir = os.path.join(parser.data_dir, "images")
             raw_count = 0
@@ -988,22 +1063,32 @@ class Trainer:
             if os.path.isdir(images_dir):
                 raw_count = len(list(Path(images_dir).glob("*_sdfeats.npy")))
                 clustered_count = len(list(Path(images_dir).glob("*_sdfeats_clustered.npy")))
-            self._semantics_available = (raw_count + clustered_count) > 0
+            desired_count = clustered_count if feature_kind == "clustered" else raw_count
+            opposite_count = raw_count if feature_kind == "clustered" else clustered_count
+            self._semantics_available = desired_count > 0
             if self._semantics_available and not cfg.semantics:
                 cfg.semantics = True
-                logger.info("Auto-enabled spotless semantics because feature files were found")
+                logger.info(f"Auto-enabled spotless semantics because {feature_kind} feature files were found")
             if cfg.semantics and not self._semantics_available:
                 logger.warning(
-                    "Spotless semantics requested but no feature files were found "
-                    f"under {images_dir} (raw={raw_count}, clustered={clustered_count})"
+                    "Spotless semantics requested but the expected feature kind was not found "
+                    f"under {images_dir} (kind={feature_kind}, raw={raw_count}, clustered={clustered_count})"
                 )
+                if opposite_count > 0:
+                    logger.warning(
+                        f"Found the opposite semantic kind instead; not falling back automatically "
+                        f"(opposite_kind={'raw' if feature_kind == 'clustered' else 'clustered'})"
+                    )
                 cfg.semantics = False
 
             scene_scale = parser.scene_scale * 1.1
 
             # Create splats from point cloud
             self._splats, self._optimizers = _create_splats_and_optimizers(
-                parser, device, sh_degree=cfg.sh_degree
+                parser,
+                device,
+                sh_degree=cfg.sh_degree,
+                scene_scale=scene_scale,
             )
             logger.info(f"Initialized {len(self._splats['means'])} splats from point cloud")
             logger.info(f"[TRAINER] Splats device: {self._splats['means'].device}")
@@ -1011,12 +1096,22 @@ class Trainer:
             if self._spotless_active and not cfg.cluster:
                 semantic_shape = getattr(trainset, "semantic_shape", None)
                 if semantic_shape is None:
-                    logger.warning("Spotless semantics are enabled but no feature shape could be inferred")
-                    self._spotless_active = False
+                    semantic_shape = _discover_semantic_shape(
+                        getattr(parser, "image_paths", []),
+                        dataset_root=getattr(parser, "data_dir", None),
+                        feature_kind=feature_kind,
+                    )
+                if semantic_shape is None:
+                    logger.warning(
+                        "Spotless semantics are enabled but no feature shape could be inferred; "
+                        "the SpotLess MLP will initialize lazily from the first valid batch"
+                    )
                 else:
                     if len(semantic_shape) < 3:
-                        logger.warning(f"Invalid semantic feature shape: {semantic_shape}")
-                        self._spotless_active = False
+                        logger.warning(
+                            f"Invalid semantic feature shape: {semantic_shape}; "
+                            "the SpotLess MLP will initialize lazily from the first valid batch"
+                        )
                     else:
                         semantic_channels = int(semantic_shape[0])
                         self._spotless_module = SpotLessModule(
@@ -1036,15 +1131,29 @@ class Trainer:
             if cfg.strategy == "mcmc":
                 self._strategy = MCMCStrategy(
                     cap_max=cfg.max_splats,
-                    refine_start_iter=500,
-                    refine_stop_iter=max(cfg.num_iterations - 5000, 1000),
-                    refine_every=100,
+                    refine_start_iter=cfg.refine_start_iter,
+                    refine_stop_iter=cfg.refine_stop_iter,
+                    refine_every=cfg.refine_every,
+                    min_opacity=cfg.prune_opa,
+                    verbose=cfg.strategy_verbose,
                 )
             else:
                 self._strategy = DefaultStrategy(
-                    refine_start_iter=500,
-                    refine_stop_iter=max(cfg.num_iterations - 5000, 1000),
-                    refine_every=100,
+                    prune_opa=cfg.prune_opa,
+                    grow_grad2d=cfg.grow_grad2d,
+                    grow_scale3d=cfg.grow_scale3d,
+                    grow_scale2d=cfg.grow_scale2d,
+                    prune_scale3d=cfg.prune_scale3d,
+                    prune_scale2d=cfg.prune_scale2d,
+                    refine_scale2d_stop_iter=cfg.refine_scale2d_stop_iter,
+                    refine_start_iter=cfg.refine_start_iter,
+                    refine_stop_iter=cfg.refine_stop_iter,
+                    reset_every=cfg.reset_every,
+                    refine_every=cfg.refine_every,
+                    pause_refine_after_reset=cfg.pause_refine_after_reset,
+                    absgrad=cfg.absgrad,
+                    revised_opacity=cfg.revised_opacity,
+                    verbose=cfg.strategy_verbose,
                 )
             self._strategy.check_sanity(self._splats, self._optimizers)
             if isinstance(self._strategy, DefaultStrategy):
@@ -1069,6 +1178,16 @@ class Trainer:
             }
             self._trainloader = torch.utils.data.DataLoader(trainset, **loader_kwargs)
             self._trainloader_iter = iter(self._trainloader)
+            self._evalloader = None
+            if evaluations_enabled and len(evalset) > 0:
+                eval_loader_kwargs = {
+                    "batch_size": 1,
+                    "shuffle": False,
+                    "num_workers": num_workers,
+                    "persistent_workers": num_workers > 0,
+                    "pin_memory": num_workers > 0,
+                }
+                self._evalloader = torch.utils.data.DataLoader(evalset, **eval_loader_kwargs)
 
             # Training loop
             self._train_start_time = time.time()
@@ -1090,6 +1209,7 @@ class Trainer:
                 camtoworlds = data["camtoworld"].to(device, non_blocking=True)
                 Ks = data["K"].to(device, non_blocking=True)
                 pixels = data["image"].to(device, non_blocking=True) / 255.0
+                sample_semantic_kind = _unwrap_singleton_string(data.get("semantic_kind"))
 
                 height, width = pixels.shape[1:3]
 
@@ -1124,7 +1244,7 @@ class Trainer:
                     packed=False,
                 )
 
-                colors_render = renders[..., :3]
+                colors_render = renders[..., :3].clamp(0.0, 1.0)
                 error_per_pixel = torch.abs(colors_render - pixels)
                 use_spotless = bool(cfg.semantics and self._semantics_available)
                 semantics_valid = data.get("semantics_valid", None)
@@ -1134,6 +1254,11 @@ class Trainer:
                             use_spotless = False
                     elif not bool(semantics_valid):
                         use_spotless = False
+                if sample_semantic_kind is not None and sample_semantic_kind != feature_kind:
+                    logger.warning(
+                        f"Semantic kind mismatch for training sample: expected {feature_kind}, got {sample_semantic_kind}"
+                    )
+                    use_spotless = False
 
                 pred_mask = None
                 pred_mask_up = None
@@ -1246,7 +1371,7 @@ class Trainer:
                                                 torch.mean((sampled_mask * err_chunk).detach().cpu(), dim=-1, keepdim=True)
                                             )
                                         spot_loss_sum = spot_loss_sum + (
-                                            F.relu(pred_chunk - lower_chunk) + F.relu(upper_chunk - pred_chunk)
+                                            F.relu(pred_chunk - upper_chunk) + F.relu(lower_chunk - pred_chunk)
                                         ).sum()
 
                                         rgb_loss_sum = rgb_loss_sum + (sampled_mask * err_chunk).sum()
@@ -1300,13 +1425,20 @@ class Trainer:
                     )
                     loss = rgbloss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
 
+                if cfg.opacity_reg > 0.0:
+                    loss = loss + cfg.opacity_reg * torch.sigmoid(self._splats["opacities"]).mean()
+                if cfg.scale_reg > 0.0:
+                    loss = loss + cfg.scale_reg * torch.exp(self._splats["scales"]).mean()
+
                 if raw_spotless_chunked:
                     self._spotless_module.train()
                 else:
                     spot_loss = None
 
                 if publish_snapshot:
-                    error_map = loss_map if loss_map is not None else torch.mean(error_per_pixel, dim=-1, keepdim=True)
+                    # Snapshot visualization should reflect the true per-pixel
+                    # reconstruction error, not the mask-weighted training target.
+                    error_map = torch.mean(error_per_pixel, dim=-1, keepdim=True)
                     semantic_preview_path = data.get("semantic_preview_path")
                     if isinstance(semantic_preview_path, (list, tuple)) and semantic_preview_path:
                         semantic_preview_path = semantic_preview_path[0]
@@ -1402,6 +1534,13 @@ class Trainer:
                     )
                     logger.info(f"[TRAINER] Timing: data={t_data:.3f}s, gpu={t_gpu:.3f}s")
 
+                if evaluations_enabled and self._evalloader is not None and (step + 1) % 1000 == 0:
+                    eval_psnr = self._evaluate_psnr(device=device)
+                    if eval_psnr is not None:
+                        with self._lock:
+                            self.eval_history.append((step + 1, eval_psnr))
+                        logger.info(f"[TRAINER] Eval PSNR at step {step + 1}: {eval_psnr:.3f}")
+
             self.status_message = "Training complete"
             logger.info("Training complete")
 
@@ -1453,7 +1592,8 @@ class Trainer:
 
             # COLMAP/Ply scenes are stored in the viewer with a Y flip; the
             # transforms.json path already lives in the viewer's raw frame.
-            if not isinstance(self._parser, _TransformsJsonParser):
+            y_flipped = not isinstance(self._parser, _TransformsJsonParser)
+            if y_flipped:
                 means[:, 1] *= -1
                 # Quaternions: [w, x, y, z] -> [w, -x, y, -z] for Y flip
                 quats[:, 1] *= -1
@@ -1471,6 +1611,7 @@ class Trainer:
             # Update scene_state under its lock
             with self.scene_state._lock:
                 self.scene_state.gaussians = gaussians
+                self.scene_state.gaussian_y_flipped = y_flipped
                 self.scene_state.has_gaussians = True
                 self.scene_state._default_gaussians = False
                 self.scene_state._bump_version()
@@ -1482,25 +1623,82 @@ class Trainer:
         scene_name = Path(colmap_path).name or "scene"
         ply_path = os.path.join(cfg.output_dir, f"{scene_name}.ply")
 
-        with torch.no_grad():
-            means = self._splats["means"].detach().clone()
-            scales = self._splats["scales"].detach().clone()
-            quats = self._splats["quats"].detach().clone()
-            opacities = self._splats["opacities"].detach().clone()
-            sh0 = self._splats["sh0"].detach().clone()
-            shN = self._splats["shN"].detach().clone()
-
-        export_splats(
-            means=means,
-            scales=scales,
-            quats=quats,
-            opacities=opacities,
-            sh0=sh0,
-            shN=shN,
-            format="ply",
-            save_to=ply_path,
-        )
+        # Reuse the same scene export path as the UI button so the written PLY
+        # matches the current viewer/training coordinate convention.
+        self._export_gaussians()
+        self.scene_state.export_ply(ply_path)
         logger.info(f"Saved PLY to {ply_path}")
+
+    @torch.no_grad()
+    def _evaluate_psnr(self, device: str) -> Optional[float]:
+        """Evaluate PSNR on the held-out split when evaluations are enabled."""
+        if self._evalloader is None or self._splats is None:
+            return None
+
+        try:
+            from torchmetrics.image import PeakSignalNoiseRatio
+
+            psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(device)
+            use_torchmetrics = True
+        except ImportError:
+            logger.warning(
+                "torchmetrics is not installed; falling back to a local PSNR computation"
+            )
+            psnr_metric = None
+            use_torchmetrics = False
+
+        sample_count = 0
+        sq_error_sum = 0.0
+        pixel_count = 0
+        for data in self._evalloader:
+            camtoworlds = data["camtoworld"].to(device, non_blocking=True)
+            Ks = data["K"].to(device, non_blocking=True)
+            pixels = data["image"].to(device, non_blocking=True) / 255.0
+            height, width = pixels.shape[1:3]
+
+            means = self._splats["means"]
+            quats = self._splats["quats"]
+            scales = torch.exp(self._splats["scales"])
+            opacities = torch.sigmoid(self._splats["opacities"])
+            colors = torch.cat([self._splats["sh0"], self._splats["shN"]], 1)
+
+            renders, _, _ = rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=torch.linalg.inv(camtoworlds),
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=self.config.sh_degree,
+                near_plane=0.01,
+                far_plane=1e10,
+                packed=False,
+            )
+            colors_render = renders[..., :3].clamp(0.0, 1.0).permute(0, 3, 1, 2)
+            pixels = pixels.permute(0, 3, 1, 2)
+            if use_torchmetrics:
+                psnr_metric.update(colors_render, pixels)
+            else:
+                diff = colors_render - pixels
+                sq_error_sum += float(torch.sum(diff * diff).item())
+                pixel_count += int(diff.numel())
+            sample_count += 1
+
+        if sample_count == 0:
+            return None
+
+        if use_torchmetrics:
+            return float(psnr_metric.compute().item())
+
+        if pixel_count == 0:
+            return None
+        mse = sq_error_sum / pixel_count
+        if mse <= 0.0:
+            return float("inf")
+        return float(-10.0 * math.log10(mse))
 
     def _publish_spotless_snapshot(
         self,

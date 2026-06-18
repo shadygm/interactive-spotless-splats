@@ -195,7 +195,7 @@ class App:
         self.ui.camera = self.camera
         self.input_handler.camera = self.camera
         self.input_handler.release_fps_cursor()
-        logger.info(f"Jumped viewport camera to dataset frustum #{index + 1}")
+        logger.debug(f"Jumped viewport camera to dataset frustum #{index + 1}")
 
     def run(self):
         while not glfw.window_should_close(self.window):

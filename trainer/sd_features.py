@@ -361,12 +361,9 @@ class SDFeaturizer:
                 ft = F.interpolate(ft, size=(max_h, max_w), mode="bilinear", align_corners=False)
             fts_resized.append(ft)
 
-        features = torch.cat(fts_resized, dim=0)  # [n, C, H, W]
-        # If multiple up_ft_index, concatenate channels
-        if len(up_ft_index) > 1:
-            features = features.permute(1, 0, 2, 3)  # [1, C_total, H, W]
-        else:
-            features = features  # Already [1, C, H, W]
+        # Concatenate features along the channel axis so multi-block extraction
+        # preserves spatial alignment and yields [1, C_total, H, W].
+        features = torch.cat(fts_resized, dim=1)
 
         # Move back to CPU and clear cache
         if self.device == "cuda":

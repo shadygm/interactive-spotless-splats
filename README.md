@@ -1,74 +1,118 @@
+# Interactive Spotless Splats
+
+Interactive viewer and trainer for NeRF On-the-go / SpotLessSplats scenes.
+
 ## Requirements
 
-- Python >= 3.10
-- CUDA-capable GPU
-- Linux (Wayland/X11), macOS, or Windows
+- Python 3.10 or newer
+- CUDA-capable GPU recommended for training and splat rendering
+- Linux, macOS, or Windows
 
-## Installation
+## Setup
 
 ```bash
-# Using uv (recommended)
 uv sync
-
-# Or using pip
-pip install -e .
 ```
+
+## Data
+
+Download the NeRF On-the-go dataset from:
+
+https://rwn17.github.io/nerf-on-the-go/
+
+Open the project page, click the `Data` link, and download the dataset archive (`on-the-go.zip`). Extract it somewhere on disk and point the viewer/trainer at the extracted scene directory.
+
+The repo supports the following dataset layouts:
+
+- COLMAP reconstructions with `sparse/0` or `sparse/`
+- `transforms.json` datasets from NeRF On-the-go / nerfstudio-style exports
+- Optional `PointCloud.ply` in the dataset root
+- Optional semantic sidecars next to images:
+  - `*_sdfeats.npy`
+  - `*_sdfeats_clustered.npy`
+
+The viewer will auto-detect the dataset format from the path you pass in.
 
 ## Usage
 
+Start the viewer:
+
 ```bash
-# Load a 3DGS PLY file
-uv run python -m viewer --ply path/to/model.ply
+uv run python -m viewer --dataset /path/to/dataset
+```
 
-# Load a dataset (auto-detects COLMAP or transforms.json format)
-uv run python -m viewer --dataset path/to/dataset/
+Load a 3DGS PLY file:
 
-# Run headless training and save outputs to ./output
-uv run python -m viewer --dataset path/to/dataset/ --headless --output ./output
+```bash
+uv run python -m viewer --ply /path/to/model.ply
+```
 
-# Customize the viewer window size
-uv run python -m viewer --ply model.ply --dataset dataset/ --width 1920 --height 1080
+Run headless training and save outputs to `./output`:
 
-# Enable debug logging
-uv run python -m viewer --ply model.ply --log-level DEBUG
+```bash
+uv run python -m viewer --dataset /path/to/dataset --headless --output ./output
+```
 
-# Extract Stable Diffusion features from a directory of images
+Adjust the window size:
+
+```bash
+uv run python -m viewer --ply /path/to/model.ply --width 1920 --height 1080
+```
+
+Enable debug logging:
+
+```bash
+uv run python -m viewer --ply /path/to/model.ply --log-level DEBUG
+```
+
+Extract Stable Diffusion features from a directory of images:
+
+```bash
 uv run python scripts/extract_sd_features.py /path/to/images --img-size 800
+```
 
-# Extract clustered Stable Diffusion features
+Extract clustered Stable Diffusion features:
+
+```bash
 uv run python scripts/extract_sd_features.py /path/to/images --img-size 800 --cluster --n-clusters 100
+```
 
-# See all viewer options
+Show all viewer options:
+
+```bash
 uv run python -m viewer --help
+```
 
-# See all feature-extraction options
+Show all feature-extraction options:
+
+```bash
 uv run python scripts/extract_sd_features.py --help
-```
-
-```
-usage: __main__.py [-h] [--dataset DATASET] [--ply PLY] [--width WIDTH] [--height HEIGHT] [--log-level {TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,CRITICAL}] [--log-file LOG_FILE] [--headless] [--output OUTPUT]
-
-options:
-  -h, --help            show this help message and exit
-  --dataset DATASET     Path to a dataset directory. Auto-detects COLMAP or transforms.json format.
-  --ply PLY
-  --width WIDTH
-  --height HEIGHT
-  --log-level {TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,CRITICAL}
-                        Log level for stderr (and file if --log-file is set). Default: INFO
-  --log-file LOG_FILE   Optional file path to also write logs to
-  --headless            Run training in headless mode (requires --dataset). No GUI is shown.
-  --output OUTPUT       Output directory for saved PLY files in headless mode. Default: ./output
 ```
 
 ## Controls
 
 | Input | Action |
-|-------|--------|
-| Left drag | Rotate camera (orbit) / Look around (FPS) |
-| Right drag | Pan camera (orbit) |
-| Scroll | Zoom (orbit) / Move speed (FPS) |
-| WASD | Move camera |
-| E / Q | Move up / down |
-| R + scroll | Roll camera |
-| ESC | Release cursor (FPS) / Quit |
+| --- | --- |
+| Left drag | Rotate camera in orbit mode / look around in FPS mode |
+| Right drag | Pan camera in orbit mode |
+| Scroll | Zoom orbit camera / change FPS move speed |
+| `WASD` | Move camera |
+| `Q` / `E` | Move down / up |
+| `R` + scroll | Roll orbit camera |
+| `ESC` | Release FPS cursor or quit |
+
+## Implementation Notes
+
+- The viewer keeps orbit, FPS, and dataset-frustum cameras in sync with the same scene state.
+- COLMAP and `transforms.json` inputs are normalized into a common internal representation.
+- On-the-go training uses rectified pinhole images and keeps the viewer and trainer aligned on the same camera contract.
+- The trainer runs in a background thread so the UI stays responsive.
+- Learned splats can be exported back to PLY from the UI or headless mode.
+
+## External Resources
+
+- NeRF On-the-go dataset and project page: https://rwn17.github.io/nerf-on-the-go/
+- `gsplat` rasterizer: `external/gsplat`
+- `imgui-bundle`, `glfw`, `PyOpenGL`, `pycolmap`, `torch`, `opencv-python`, and related Python packages from `pyproject.toml`
+- Stable Diffusion feature extraction script: `scripts/extract_sd_features.py`
+

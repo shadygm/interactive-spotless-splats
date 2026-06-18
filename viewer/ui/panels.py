@@ -20,6 +20,7 @@ class ScenePanel(Panel):
         self._ply_path_input = ""
         self._dataset_dialog = None
         self._ply_dialog = None
+        self._export_dialog = None
         self.pending_dataset_path = None
         self.pending_ply_path = None
 
@@ -48,6 +49,30 @@ class ScenePanel(Panel):
                     path = result[0] if isinstance(result, list) else result
                     logger.info(f"Selected PLY file: {path}")
                     self.pending_ply_path = path
+
+        imgui.separator()
+
+        can_export = self.scene_state.has_exportable_gaussians()
+        imgui.begin_disabled(not can_export)
+        if imgui.button("Export PLY"):
+            self._export_dialog = pfd.save_file("Save PLY", filters=["*.ply"])
+            logger.debug("Opened PLY export dialog")
+        imgui.end_disabled()
+
+        if not can_export:
+            imgui.text_disabled("Load or train a splat file to enable export")
+
+        if self._export_dialog is not None:
+            if self._export_dialog.ready():
+                result = self._export_dialog.result()
+                self._export_dialog = None
+                if result:
+                    path = result[0] if isinstance(result, list) else result
+                    try:
+                        exported_path = self.scene_state.export_ply(path)
+                        logger.info(f"Exported scene splats to {exported_path}")
+                    except Exception as exc:
+                        logger.error(f"Failed to export PLY to {path}: {exc}")
 
         imgui.separator()
 
